@@ -29,3 +29,5 @@
 //! [ADR 0009]: https://github.com/ithaka-dev/verity-foundation/blob/main/docs/decisions/0009-verification-model.md
 
 #![doc(html_root_url = "https://docs.rs/verity-verifier")]
+
+pub mod quote;
