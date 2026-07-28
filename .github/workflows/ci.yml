@@ -49,6 +49,9 @@ jobs:
           curl -fsSL https://dist.ipfs.tech/kubo/v0.42.0/kubo_v0.42.0_linux-amd64.tar.gz | tar -xz
           sudo install kubo/ipfs /usr/local/bin/ipfs
           ipfs --version
+          # The CLI is a client of the service container, not a second node. Without this it looks
+          # for a local repo that does not exist, and every publish fails.
+          ipfs init --profile server
       - run: cargo test --features fetch --test compose_fetch -- --nocapture
 
   wasm:
@@ -57,9 +60,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # rust-toolchain.toml pins the toolchain and overrides the action's `targets:`, so the wasm32
+      # standard library must be added against the pinned toolchain rather than the action's.
+      - run: rustup target add wasm32-unknown-unknown
       # The crate claims wasm32 support. A claim nothing builds is aspiration, so it is built here.
       - run: cargo build -p verity-verifier-wasm --target wasm32-unknown-unknown
       # The core must also build without `attest`, since that is what makes the target reachable.

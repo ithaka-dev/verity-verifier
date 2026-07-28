@@ -17,7 +17,9 @@ workspace = true
 [dependencies]
 # No `attest`: these bindings do not verify signatures (the verdict reports that explicitly), and
 # the dependency it pulls in cannot build for wasm32.
-verity-verifier = { path = "../verity-verifier", default-features = false }
+# `version` alongside `path` is required to publish at all — crates.io rejects path-only
+# dependencies — and it is what makes this a pinned dependency rather than a wildcard.
+verity-verifier = { path = "../verity-verifier", version = "0.0.0", default-features = false }
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"

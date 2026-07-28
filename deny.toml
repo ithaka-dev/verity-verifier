@@ -6,14 +6,27 @@
 
 [advisories]
 yanked = "deny"
+# Mirrors .cargo/audit.toml. The two tools read separate configuration, so the exception has to
+# exist in both — and the reasoning lives in audit.toml rather than being restated here, so there
+# is one place to revisit rather than two that can disagree.
+#
+# RUSTSEC-2023-0071: Marvin timing sidechannel in `rsa`, reached via dcap-qvl. Does not apply —
+# this crate holds no private keys and performs no RSA private-key operations. See
+# .cargo/audit.toml for the full analysis and the review trigger.
+ignore = ["RUSTSEC-2023-0071"]
 
 [bans]
 multiple-versions = "warn"
+# Wildcards are denied because an unversioned dependency is unpinnable. Workspace-internal path
+# dependencies are exempt: they resolve to code in this repository, so there is nothing to pin.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [licenses]
 # AGPL-3.0-only for this crate; dependencies must be compatible and non-copyleft-conflicting.
 allow = [
+    # Our own crates. The exact SPDX id matters — "AGPL-3.0" does not match "AGPL-3.0-only".
+    "AGPL-3.0-only",
     "AGPL-3.0",
     "Apache-2.0",
     "MIT",
@@ -22,6 +35,9 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
+    # Data, not code: carried by dependencies that embed published datasets (root certificate
+    # stores and similar). Permissive, and does not impose obligations on the software.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 

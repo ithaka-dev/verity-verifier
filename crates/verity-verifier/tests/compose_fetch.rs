@@ -48,8 +48,18 @@ fn node_available() -> bool {
 
 /// Add the fixture to the local node and return its CID.
 fn publish_fixture() -> String {
+    // Address the daemon explicitly. Without this the CLI uses whatever local repo it finds, which
+    // in CI is a different node from the one the test then reads through.
+    let api_multiaddr = api()
+        .replace("http://", "")
+        .replace("https://", "")
+        .split(':')
+        .collect::<Vec<_>>()
+        .join("/tcp/");
     let out = Command::new("ipfs")
         .args([
+            "--api",
+            &format!("/ip4/{api_multiaddr}"),
             "add",
             "-Q",
             "--cid-version",
