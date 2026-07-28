@@ -27,6 +27,9 @@ expect_used = "warn"
 [workspace.dependencies]
 thiserror = "2"
 proptest = "1"
+# Sync HTTP. Deliberately not an async client: the core verification path does no I/O, and
+# pulling tokio into a library agents embed would leak a runtime choice into their process.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [profile.release]
 overflow-checks = true

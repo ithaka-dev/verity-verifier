@@ -11,8 +11,15 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Retrieval helpers. Off by default: verification itself takes bytes and does no I/O, so an
+# embedder that already has the compose document pays nothing for an HTTP client.
+fetch = ["dep:ureq"]
+
 [dependencies]
 thiserror = { workspace = true }
+ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
