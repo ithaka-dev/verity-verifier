@@ -199,3 +199,26 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 const _: () = assert!(MEASUREMENT_LEN == 48);
+
+/// An implausible declared signature length is reported as such, not as "too short".
+///
+/// On 64-bit this specific overflow is unreachable, but `usize` is 32-bit on `wasm32` — a target
+/// this crate ships bindings for — so the branch is live there. The test pins the *error
+/// semantics* on every target: a length field the parser cannot act on is a distinct defect from
+/// a buffer that ran out.
+#[test]
+fn implausible_signature_length_is_its_own_error() {
+    let mut bytes = decode(QUOTE_HEX);
+    bytes[48 + 584..48 + 584 + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    match Quote::parse(&bytes) {
+        // 64-bit: the addition succeeds, so the buffer is simply short of a colossal declaration.
+        Err(ParseError::SignatureTruncated { declared, .. }) => {
+            assert!(declared > bytes.len());
+        }
+        // 32-bit: the addition overflows and the length itself is the defect.
+        Err(ParseError::SignatureLengthImplausible { declared }) => {
+            assert_eq!(declared, u32::MAX);
+        }
+        other => panic!("expected a signature-length error, got {other:?}"),
+    }
+}

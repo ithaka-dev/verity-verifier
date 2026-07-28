@@ -81,7 +81,15 @@ impl fmt::Display for Measurement {
 ///
 /// Parsing refuses rather than guessing. A quote that is too short, or that claims a TEE type
 /// this crate does not understand, produces an error — never a partially populated result.
+/// New variants will be added as verification grows — tag validation, signature-chain failures —
+/// so this enum is `#[non_exhaustive]`. Downstream `match` arms need a wildcard, and adding a
+/// variant stays a minor version rather than a breaking one. That matters more here than usual:
+/// [ADR 0014] makes version discipline a first-class concern for a crate embedded in agents that
+/// cannot easily be updated.
+///
+/// [ADR 0014]: https://github.com/ithaka-dev/verity-foundation/blob/main/docs/decisions/0014-verifier-update-discipline.md
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ParseError {
     /// The input is shorter than a header plus report body.
     #[error("quote too short: {got} bytes, need at least {need}")]
@@ -107,6 +115,17 @@ pub enum ParseError {
         got: usize,
         /// Bytes the quote declares it should have.
         declared: usize,
+    },
+    /// The quote declares a signature section too large to be real.
+    ///
+    /// Separate from [`Self::SignatureTruncated`] because the defect is different: the length
+    /// field itself is implausible rather than the buffer being short. Reachable on 32-bit
+    /// targets — `wasm32` among them, which this crate ships bindings for — where an
+    /// attacker-supplied length near `u32::MAX` overflows a `usize`.
+    #[error("declared signature length {declared} is implausible")]
+    SignatureLengthImplausible {
+        /// The length the quote declared.
+        declared: u32,
     },
     /// The input was not valid hexadecimal.
     #[error("input is not valid hexadecimal")]
@@ -197,10 +216,16 @@ impl Quote {
 
         // A quote missing its signature section can never verify, so refuse it here rather than
         // reporting a successful parse on input that is structurally incomplete.
-        let sig_len = le_u32(OFF_SIG_LEN)? as usize;
-        let declared = MIN_QUOTE_LEN
-            .checked_add(sig_len)
-            .ok_or_else(|| too_short(usize::MAX))?;
+        let sig_len_raw = le_u32(OFF_SIG_LEN)?;
+        // usize is 32-bit on wasm32, so this addition genuinely can overflow there. Reporting it
+        // as "too short, you need usize::MAX bytes" would be nonsense; the defect is that the
+        // declared length is implausible, so say that.
+        let declared = usize::try_from(sig_len_raw)
+            .ok()
+            .and_then(|n| MIN_QUOTE_LEN.checked_add(n))
+            .ok_or(ParseError::SignatureLengthImplausible {
+                declared: sig_len_raw,
+            })?;
         if bytes.len() < declared {
             return Err(ParseError::SignatureTruncated {
                 got: bytes.len(),
