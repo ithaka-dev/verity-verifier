@@ -12,7 +12,12 @@ authors.workspace = true
 workspace = true
 
 [features]
-default = []
+default = ["attest"]
+# Intel DCAP signature verification. On by default because a verifier that cannot check Intel's
+# signature is not verifying anything — but separable, because it pulls in `ring`, which does not
+# build for wasm32-unknown-unknown. Consumers doing only the compose-side checks (the WASM
+# bindings, for one) opt out and keep the target buildable.
+attest = ["dep:dcap-qvl"]
 # Retrieval helpers. Off by default: verification itself takes bytes and does no I/O, so an
 # embedder that already has the compose document pays nothing for an HTTP client.
 fetch = ["dep:ureq"]
@@ -22,7 +27,7 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
 yaml-rust2 = { workspace = true }
-dcap-qvl = { workspace = true }
+dcap-qvl = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
 
 [dev-dependencies]

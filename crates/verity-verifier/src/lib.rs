@@ -58,6 +58,7 @@
 
 #![doc(html_root_url = "https://docs.rs/verity-verifier")]
 
+#[cfg(feature = "attest")]
 pub mod attest;
 pub mod binding;
 pub mod compose;
@@ -65,4 +66,5 @@ pub mod images;
 pub mod quote;
 pub mod reference;
 pub mod verdict;
+#[cfg(feature = "attest")]
 pub mod verify;

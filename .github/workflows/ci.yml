@@ -48,6 +48,20 @@ jobs:
           ipfs --version
       - run: cargo test --features fetch --test compose_fetch -- --nocapture
 
+  wasm:
+    name: wasm32 target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # The crate claims wasm32 support. A claim nothing builds is aspiration, so it is built here.
+      - run: cargo build -p verity-verifier-wasm --target wasm32-unknown-unknown
+      # The core must also build without `attest`, since that is what makes the target reachable.
+      - run: cargo build -p verity-verifier --no-default-features
+
   no-dangerous-attestation:
     name: TCB enforcement is not overridable
     runs-on: ubuntu-latest

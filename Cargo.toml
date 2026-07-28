@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/verity-verifier"]
+members = ["crates/verity-verifier", "crates/verity-verifier-wasm"]
 
 [workspace.package]
 version = "0.0.0"

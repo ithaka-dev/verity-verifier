@@ -1,0 +1,32 @@
+[package]
+name = "verity-verifier-wasm"
+description = "WASM and Node bindings for verity-verifier."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# No `attest`: these bindings do not verify signatures (the verdict reports that explicitly), and
+# the dependency it pulls in cannot build for wasm32.
+verity-verifier = { path = "../verity-verifier", default-features = false }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+
+# getrandom reaches wasm32-unknown-unknown transitively and refuses to build there without a
+# browser/Node entropy source. Enabling "js" is what makes the wasm32 claim in the docs true —
+# without it the target simply does not compile, and "supports wasm32" would be aspiration.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
