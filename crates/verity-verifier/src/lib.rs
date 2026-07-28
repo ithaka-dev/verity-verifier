@@ -30,6 +30,7 @@
 
 #![doc(html_root_url = "https://docs.rs/verity-verifier")]
 
+pub mod attest;
 pub mod binding;
 pub mod compose;
 pub mod images;

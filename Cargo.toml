@@ -34,6 +34,13 @@ sha2 = "0.10"
 # hand-rolled scanner that misses one reference recreates exactly the hole it was written to close.
 serde_json = "1"
 yaml-rust2 = "0.11"
+# Intel DCAP quote verification. Pinned minor: this is the crate that decides whether Intel signed
+# the statement we are about to trust, and the handbook requires pinning for cryptographic deps.
+#
+# NOTE: dcap-qvl exposes a `danger-allow-tcb-override` feature. It must never be enabled. ADR 0014
+# makes TCB status enforcement mandatory and not configurable, and a feature flag that switches it
+# off is exactly the "strict mode someone leaves unset" that ADR forbids. CI asserts its absence.
+dcap-qvl = "0.6"
 proptest = "1"
 # Sync HTTP. Deliberately not an async client: the core verification path does no I/O, and
 # pulling tokio into a library agents embed would leak a runtime choice into their process.

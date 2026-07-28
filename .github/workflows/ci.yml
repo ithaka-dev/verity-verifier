@@ -48,6 +48,27 @@ jobs:
           ipfs --version
       - run: cargo test --features fetch --test compose_fetch -- --nocapture
 
+  no-dangerous-attestation:
+    name: TCB enforcement is not overridable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # ADR 0014: TCB status enforcement is mandatory and not configurable. dcap-qvl ships both a
+      # `danger-allow-tcb-override` feature and a `dangerous_verify_with_tcb_override` function.
+      # A flag that turns a security check off is the flag someone eventually leaves off, so their
+      # absence is asserted rather than assumed.
+      - name: no danger-allow-tcb-override feature
+        run: |
+          if cargo tree -e features --all-features | grep -q "danger-allow-tcb-override"; then
+            echo "::error::danger-allow-tcb-override is enabled; ADR 0014 forbids it"; exit 1
+          fi
+      - name: no dangerous_verify_with_tcb_override call
+        run: |
+          if grep -rn "dangerous_verify_with_tcb_override" crates/ 2>/dev/null; then
+            echo "::error::TCB override API is called; ADR 0014 forbids it"; exit 1
+          fi
+
   supply-chain:
     name: audit · deny
     runs-on: ubuntu-latest
