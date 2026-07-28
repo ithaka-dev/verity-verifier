@@ -164,8 +164,118 @@ pub trait Source {
 /// A compose document is small. Anything much larger is not one.
 pub const DEFAULT_SIZE_LIMIT: usize = 1024 * 1024;
 
+/// How long to wait for a connection before giving up.
+pub const DEFAULT_CONNECT_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
+
+/// How long a whole retrieval may take.
+///
+/// Bounded because a source that accepts a connection and then trickles bytes forever would
+/// otherwise stall a verification indefinitely — a denial of service that needs no exploit, only
+/// patience.
+pub const DEFAULT_TOTAL_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(30);
+
+/// How many documents [`Cached`] holds before it starts discarding.
+pub const DEFAULT_CACHE_CAPACITY: usize = 64;
+
 #[cfg(feature = "fetch")]
 mod http;
 
 #[cfg(feature = "fetch")]
 pub use http::{Gateway, HttpUrl, KuboRpc};
+
+/// Caches what a wrapped [`Source`] returns.
+///
+/// Compose documents are small and immutable per version, so re-fetching one is waste and an
+/// avoidable dependency on the source still being reachable.
+///
+/// # Why caching cannot cause a wrong answer
+///
+/// A cache is normally a correctness risk: serve something stale and the caller acts on it. Here it
+/// is not, because **the hash check happens after retrieval, on every call.** A stale or wrong entry
+/// fails that check exactly as a stale or wrong network response would. The worst a poisoned cache
+/// can do is cause a spurious *refusal* — never a spurious success.
+///
+/// That is worth stating plainly, because it is the reason this wrapper is allowed to exist at all
+/// in a component whose job is to not be fooled.
+#[derive(Debug)]
+pub struct Cached<S> {
+    inner: S,
+    capacity: usize,
+    entries: std::sync::Mutex<std::collections::HashMap<ComposeUri, Vec<u8>>>,
+}
+
+impl<S> Cached<S> {
+    /// Wrap `inner` with an in-memory cache.
+    ///
+    /// Deliberately not persistent: a cache surviving process restart is a different design with
+    /// its own invalidation and on-disk-tampering questions, and nothing yet needs it.
+    #[must_use]
+    pub fn new(inner: S) -> Self {
+        Self::with_capacity(inner, DEFAULT_CACHE_CAPACITY)
+    }
+
+    /// Wrap `inner` with a cache holding at most `capacity` documents.
+    ///
+    /// **Bounded deliberately.** An agent verifying many licences accumulates one entry per
+    /// distinct URI, and an unbounded map keyed by something the caller does not control is a
+    /// memory-growth vector that needs no attacker, only time.
+    #[must_use]
+    pub fn with_capacity(inner: S, capacity: usize) -> Self {
+        Self {
+            inner,
+            capacity: capacity.max(1),
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The most documents this cache will hold.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// How many documents are held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.lock().map_or(0, |e| e.len())
+    }
+
+    /// Whether nothing is held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Discard everything cached.
+    pub fn clear(&self) {
+        if let Ok(mut e) = self.entries.lock() {
+            e.clear();
+        }
+    }
+}
+
+impl<S: Source> Source for Cached<S> {
+    fn fetch(&self, uri: &ComposeUri) -> Result<Vec<u8>, FetchError> {
+        // A poisoned lock means another thread panicked mid-cache. That is not a reason to fail a
+        // fetch — fall through to the source rather than propagating someone else's panic into a
+        // verification path.
+        if let Ok(entries) = self.entries.lock() {
+            if let Some(hit) = entries.get(uri) {
+                return Ok(hit.clone());
+            }
+        }
+        let bytes = self.inner.fetch(uri)?;
+        if let Ok(mut entries) = self.entries.lock() {
+            // At capacity, drop an arbitrary entry rather than growing. Not LRU: every entry is
+            // equally cheap to re-fetch and equally safe to lose, because the hash check runs
+            // regardless of where the bytes came from. Ranking them would buy nothing.
+            if entries.len() >= self.capacity && !entries.contains_key(uri) {
+                if let Some(victim) = entries.keys().next().cloned() {
+                    entries.remove(&victim);
+                }
+            }
+            entries.insert(uri.clone(), bytes.clone());
+        }
+        Ok(bytes)
+    }
+}

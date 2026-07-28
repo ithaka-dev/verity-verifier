@@ -23,6 +23,31 @@ jobs:
       - run: cargo clippy --all-targets --all-features
       - run: cargo test --all-features
 
+  fetch:
+    name: fetch (against a real IPFS node)
+    runs-on: ubuntu-latest
+    services:
+      # These tests must actually run in CI, not skip. A quietly skipped fetch test is
+      # indistinguishable from a passing one, which is how a broken retrieval path ships green.
+      ipfs:
+        image: ipfs/kubo@sha256:6c1e1b4e2e0bf6f38ba18b2e3d1bd1a6d0e5c7c60b6f27eb6dc93a1b73b28d55
+        ports:
+          - 5001:5001
+          - 8080:8080
+    env:
+      IPFS_API: http://127.0.0.1:5001
+      IPFS_GATEWAY: http://127.0.0.1:8080
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install ipfs cli
+        run: |
+          curl -fsSL https://dist.ipfs.tech/kubo/v0.42.0/kubo_v0.42.0_linux-amd64.tar.gz | tar -xz
+          sudo install kubo/ipfs /usr/local/bin/ipfs
+          ipfs --version
+      - run: cargo test --features fetch --test compose_fetch -- --nocapture
+
   supply-chain:
     name: audit · deny
     runs-on: ubuntu-latest

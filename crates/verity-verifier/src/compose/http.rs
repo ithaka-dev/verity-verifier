@@ -4,7 +4,10 @@
 
 use std::io::Read as _;
 
-use super::{ComposeUri, FetchError, Source, DEFAULT_SIZE_LIMIT};
+use super::{
+    ComposeUri, FetchError, Source, DEFAULT_CONNECT_TIMEOUT, DEFAULT_SIZE_LIMIT,
+    DEFAULT_TOTAL_TIMEOUT,
+};
 
 /// Read a response body, refusing anything over `limit`.
 ///
@@ -19,9 +22,7 @@ fn read_capped(
     let mut buf = Vec::new();
     let read = reader
         .by_ref()
-        .take(
-            u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1),
-        )
+        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|e| FetchError::Transport {
             uri: uri.to_owned(),
@@ -36,35 +37,44 @@ fn read_capped(
     Ok(buf)
 }
 
+/// A client with explicit timeouts.
+///
+/// Not left to library defaults. Whether a verification can hang forever is a security property,
+/// and "whatever the HTTP crate currently does" is not a property — it is a version-dependent
+/// accident. A source that accepts a connection and then stalls must eventually lose.
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(DEFAULT_CONNECT_TIMEOUT))
+        .timeout_global(Some(DEFAULT_TOTAL_TIMEOUT))
+        .build()
+        .into()
+}
+
 fn get(url: &str, limit: usize) -> Result<Vec<u8>, FetchError> {
-    let response = ureq::get(url)
-        .call()
-        .map_err(|e| match &e {
-            ureq::Error::StatusCode(code) => FetchError::Status {
-                uri: url.to_owned(),
-                status: *code,
-            },
-            _ => FetchError::Transport {
-                uri: url.to_owned(),
-                detail: e.to_string(),
-            },
-        })?;
+    let response = agent().get(url).call().map_err(|e| match &e {
+        ureq::Error::StatusCode(code) => FetchError::Status {
+            uri: url.to_owned(),
+            status: *code,
+        },
+        _ => FetchError::Transport {
+            uri: url.to_owned(),
+            detail: e.to_string(),
+        },
+    })?;
     read_capped(response.into_body().into_reader(), url, limit)
 }
 
 fn post(url: &str, limit: usize) -> Result<Vec<u8>, FetchError> {
-    let response = ureq::post(url)
-        .send_empty()
-        .map_err(|e| match &e {
-            ureq::Error::StatusCode(code) => FetchError::Status {
-                uri: url.to_owned(),
-                status: *code,
-            },
-            _ => FetchError::Transport {
-                uri: url.to_owned(),
-                detail: e.to_string(),
-            },
-        })?;
+    let response = agent().post(url).send_empty().map_err(|e| match &e {
+        ureq::Error::StatusCode(code) => FetchError::Status {
+            uri: url.to_owned(),
+            status: *code,
+        },
+        _ => FetchError::Transport {
+            uri: url.to_owned(),
+            detail: e.to_string(),
+        },
+    })?;
     read_capped(response.into_body().into_reader(), url, limit)
 }
 
@@ -144,10 +154,9 @@ impl Source for KuboRpc {
     fn fetch(&self, uri: &ComposeUri) -> Result<Vec<u8>, FetchError> {
         match uri {
             // The RPC API is POST-only, including for reads.
-            ComposeUri::Ipfs(cid) => post(
-                &format!("{}/api/v0/cat?arg={cid}", self.api),
-                self.limit,
-            ),
+            ComposeUri::Ipfs(cid) => {
+                post(&format!("{}/api/v0/cat?arg={cid}", self.api), self.limit)
+            }
             ComposeUri::Http(url) => Err(FetchError::Unsupported {
                 source_kind: "KuboRpc",
                 uri: url.clone(),
