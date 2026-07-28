@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/verity-verifier"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "AGPL-3.0-only"
+repository = "https://github.com/ithaka-dev/verity-verifier"
+authors = ["Project Verity"]
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Verification code branches on byte layouts; indexing panics are caught by tests,
+# but silent truncation is not. Prefer explicit handling.
+indexing_slicing = "warn"
+panic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+overflow-checks = true
