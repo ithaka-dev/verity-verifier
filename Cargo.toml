@@ -29,6 +29,11 @@ thiserror = "2"
 # Pinned minor: the handbook requires it for cryptographic dependencies, and this hash is the
 # binding between what was licensed and what was measured.
 sha2 = "0.10"
+# The compose is JSON with an embedded docker-compose YAML document. Both are parsed with real
+# parsers rather than scanned by hand: this check exists to catch a tag hiding among images, and a
+# hand-rolled scanner that misses one reference recreates exactly the hole it was written to close.
+serde_json = "1"
+yaml-rust2 = "0.11"
 proptest = "1"
 # Sync HTTP. Deliberately not an async client: the core verification path does no I/O, and
 # pulling tokio into a library agents embed would leak a runtime choice into their process.

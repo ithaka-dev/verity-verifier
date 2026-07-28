@@ -20,7 +20,10 @@ fetch = ["dep:ureq"]
 [dependencies]
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+serde_json = { workspace = true }
+yaml-rust2 = { workspace = true }
 ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+serde_json = { workspace = true }

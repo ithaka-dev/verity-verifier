@@ -32,4 +32,5 @@
 
 pub mod binding;
 pub mod compose;
+pub mod images;
 pub mod quote;
