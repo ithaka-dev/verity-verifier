@@ -12,5 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }

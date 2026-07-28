@@ -53,6 +53,9 @@ impl Measurement {
     ///
     /// Worth checking explicitly: an unpopulated field is all-zero, and treating that as a
     /// legitimate value would compare successfully against a reference someone also left empty.
+    ///
+    /// `MROWNER` and `MROWNERCONFIG` are unpopulated on dstack 0.5.7, so a comparison against
+    /// either is a comparison against nothing.
     #[must_use]
     pub fn is_zero(&self) -> bool {
         self.0.iter().all(|b| *b == 0)
@@ -78,9 +81,10 @@ impl fmt::Display for Measurement {
 ///
 /// Parsing refuses rather than guessing. A quote that is too short, or that claims a TEE type
 /// this crate does not understand, produces an error — never a partially populated result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
     /// The input is shorter than a header plus report body.
+    #[error("quote too short: {got} bytes, need at least {need}")]
     TooShort {
         /// Bytes supplied.
         got: usize,
@@ -88,13 +92,16 @@ pub enum ParseError {
         need: usize,
     },
     /// The quote structure version is not one this crate parses.
+    #[error("unsupported quote version {0}")]
     UnsupportedVersion(u16),
     /// The `tee_type` field is not TDX.
+    #[error("tee_type 0x{0:x} is not TDX (0x81)")]
     NotTdx(u32),
     /// The signature section is shorter than the quote's own `signature_data_len` declares.
     ///
     /// Such a quote can never verify, so it is refused at parse time rather than reported as a
     /// successful parse that fails later.
+    #[error("signature section truncated: {got} bytes, quote declares {declared}")]
     SignatureTruncated {
         /// Bytes supplied.
         got: usize,
@@ -102,27 +109,9 @@ pub enum ParseError {
         declared: usize,
     },
     /// The input was not valid hexadecimal.
+    #[error("input is not valid hexadecimal")]
     InvalidHex,
 }
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooShort { got, need } => {
-                write!(f, "quote too short: {got} bytes, need at least {need}")
-            }
-            Self::UnsupportedVersion(v) => write!(f, "unsupported quote version {v}"),
-            Self::NotTdx(t) => write!(f, "tee_type 0x{t:x} is not TDX (0x{TEE_TYPE_TDX:x})"),
-            Self::SignatureTruncated { got, declared } => write!(
-                f,
-                "signature section truncated: {got} bytes, quote declares {declared}"
-            ),
-            Self::InvalidHex => f.write_str("input is not valid hexadecimal"),
-        }
-    }
-}
-
-impl core::error::Error for ParseError {}
 
 /// The measured fields of a TDX quote.
 ///
@@ -141,6 +130,23 @@ pub struct Quote {
 
 impl Quote {
     /// Parse a quote from raw bytes.
+    ///
+    /// # Examples
+    ///
+    /// A buffer too short to contain a header and report body is refused, and the error says how
+    /// much was needed:
+    ///
+    /// ```
+    /// use verity_verifier::quote::{ParseError, Quote};
+    ///
+    /// match Quote::parse(&[0u8; 16]) {
+    ///     Err(ParseError::TooShort { got, need }) => {
+    ///         assert_eq!(got, 16);
+    ///         assert!(need > got);
+    ///     }
+    ///     other => panic!("expected TooShort, got {other:?}"),
+    /// }
+    /// ```
     ///
     /// # Errors
     ///
@@ -171,6 +177,13 @@ impl Quote {
                 .map_err(|_| too_short(off + 4))?;
             Ok(u32::from_le_bytes(s))
         };
+
+        // Length is checked before any field is interpreted. Reading a version out of a buffer
+        // that is not a quote produces a confident, wrong answer — a caller handed 16 stray bytes
+        // should be told the input is too short, not that it is "version 0".
+        if bytes.len() < MIN_QUOTE_LEN {
+            return Err(too_short(MIN_QUOTE_LEN));
+        }
 
         // Header: version (2) | att_key_type (2) | tee_type (4) | ...
         let version = le_u16(0)?;
@@ -222,13 +235,24 @@ impl Quote {
 
     /// Parse a quote from a hexadecimal string, with or without a `0x` prefix.
     ///
+    /// # Examples
+    ///
+    /// Malformed input is refused rather than partially parsed:
+    ///
+    /// ```
+    /// use verity_verifier::quote::{ParseError, Quote};
+    ///
+    /// assert_eq!(Quote::parse_hex("not hex"), Err(ParseError::InvalidHex));
+    /// assert_eq!(Quote::parse_hex("abc"), Err(ParseError::InvalidHex));
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`ParseError::InvalidHex`] for malformed input, or any error from [`Self::parse`].
     pub fn parse_hex(hex: &str) -> Result<Self, ParseError> {
         let s = hex.trim();
         let s = s.strip_prefix("0x").unwrap_or(s);
-        if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(ParseError::InvalidHex);
         }
         let mut bytes = Vec::with_capacity(s.len() / 2);

@@ -2,3 +2,6 @@
 **/*.rs.bk
 Cargo.lock.orig
 .DS_Store
+
+# Published library: lockfile is not committed (ChainSafe handbook, Rust)
+Cargo.lock
