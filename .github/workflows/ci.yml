@@ -30,7 +30,10 @@ jobs:
       # These tests must actually run in CI, not skip. A quietly skipped fetch test is
       # indistinguishable from a passing one, which is how a broken retrieval path ships green.
       ipfs:
-        image: ipfs/kubo@sha256:6c1e1b4e2e0bf6f38ba18b2e3d1bd1a6d0e5c7c60b6f27eb6dc93a1b73b28d55
+        # Digest resolved from the registry for v0.42.0, not hand-written. A fabricated digest is
+        # how this job failed the first time -- and pinning by digest is only a guarantee if the
+        # digest came from the registry rather than from a person.
+        image: ipfs/kubo@sha256:8907cb0cc1ad5798f6bb1bb1341a800990c268e021cedfa317e8aa1a33864214
         ports:
           - 5001:5001
           - 8080:8080
@@ -90,9 +93,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # This repo does not commit Cargo.lock -- it is a library, and the handbook says not to.
+      # cargo-audit needs one, so it is generated here rather than tracked.
+      - name: generate lockfile
+        run: cargo generate-lockfile
+      # Run the binary directly rather than via rustsec/audit-check: the action does not read
+      # .cargo/audit.toml, and the documented RUSTSEC-2023-0071 exception lives there. An audit that
+      # ignored our reasoning would either fail always or need the exception duplicated.
       - name: cargo audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
