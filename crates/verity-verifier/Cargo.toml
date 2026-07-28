@@ -19,6 +19,7 @@ fetch = ["dep:ureq"]
 
 [dependencies]
 thiserror = { workspace = true }
+sha2 = { workspace = true }
 ureq = { workspace = true, optional = true }
 
 [dev-dependencies]

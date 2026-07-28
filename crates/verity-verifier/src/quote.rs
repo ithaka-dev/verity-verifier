@@ -43,6 +43,15 @@ const OFF_RTMR3: usize = 472;
 pub struct Measurement([u8; MEASUREMENT_LEN]);
 
 impl Measurement {
+    /// From raw bytes.
+    ///
+    /// Public so that a *reference* measurement can be constructed for comparison. Constructing
+    /// one does not assert it came from a quote — only [`Quote::parse`] does that.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; MEASUREMENT_LEN]) -> Self {
+        Self(bytes)
+    }
+
     /// The raw bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; MEASUREMENT_LEN] {
