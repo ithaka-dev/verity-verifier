@@ -24,6 +24,34 @@
 //!    narrow *what* is compared to values that are legitimately stable — never to weaken *how
 //!    strictly* they are compared.
 //!
+//! # Using it
+//!
+//! ```no_run
+//! use verity_verifier::verify::{verify, Evidence, LicensedVersion};
+//! use verity_verifier::{attest::TcbPolicy, binding::ComposeHash};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # let (raw_quote, compose_document, collateral) = (vec![], vec![], unimplemented!());
+//! let licensed = LicensedVersion {
+//!     compose_hash: ComposeHash::parse_hex("64690ef3…")?,
+//!     image_digest: "sha256:d9e853e8…".to_owned(),
+//! };
+//!
+//! let verdict = verify(
+//!     &licensed,
+//!     &Evidence { raw_quote: &raw_quote, compose_document, collateral: &collateral, now_secs: 0 },
+//!     None,
+//!     &TcbPolicy::default(),
+//! );
+//!
+//! // Never a bare boolean: the verdict says which checks ran, and what each concluded.
+//! if !verdict.is_trustworthy() {
+//!     eprintln!("{verdict}");
+//!     return Err("refusing to trust this endpoint".into());
+//! }
+//! # Ok(()) }
+//! ```
+//!
 //! See [ADR 0009] for the full verification model.
 //!
 //! [ADR 0009]: https://github.com/ithaka-dev/verity-foundation/blob/main/docs/decisions/0009-verification-model.md
@@ -35,3 +63,6 @@ pub mod binding;
 pub mod compose;
 pub mod images;
 pub mod quote;
+pub mod reference;
+pub mod verdict;
+pub mod verify;

@@ -37,6 +37,33 @@ an implementation of decisions made there, not the decisions themselves.
 **If a decision seems missing, it probably isn't — go and find it.** If it genuinely is missing,
 it belongs in an ADR in `verity-foundation`, not in a pull request here.
 
+## The three rules
+
+Recorded here rather than only in the code, because they are the ones violated under deadline
+pressure and a reader who never opens the source should still meet them.
+
+1. **Never compare `RTMR3`.** It accumulates `app-id`, `instance-id` and `mr-kms`, and the last
+   varies per boot, so no stable reference exists. Comparing it produces intermittent false
+   refusals. The boot-reference type has no field for it — leaving it out of the type is stronger
+   than documenting that it should be skipped.
+2. **Branch on the `MR-CONFIG-ID` prefix byte; never assume `0x01`.** V1 and V2 are different
+   constructions, and which applies is a property of the platform, not of this crate.
+3. **Never loosen a check to resolve a mismatch.** Rule 1 guarantees somebody eventually sees a
+   spurious failure. Relaxing a comparison until it passes turns this library into decoration while
+   everything continues to look like it works. The correct response is to narrow *what* is compared
+   to values that are legitimately stable — never to weaken *how strictly*.
+
+## What a verdict tells you
+
+Never a bare boolean. Every verdict carries the verifier version, the reference-data date, and
+**which checks actually ran** — which is what makes a weakened verifier detectable. One that quietly
+stopped comparing `MR-CONFIG-ID` still returns "verified", but it can no longer claim to have
+compared it.
+
+Enforcement is impossible: this runs on the agent's side and nobody can compel an update. So the
+goal is not prevention but **visibility** — a stale or loosened verifier must not be able to be
+either invisibly.
+
 ## Boundary
 
 Verification happens **here or nowhere**. If this step is skipped or weakened, the whole system degrades to "login plus a container spawn" (spec §4.5).
