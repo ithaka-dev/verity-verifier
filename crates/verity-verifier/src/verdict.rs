@@ -181,7 +181,6 @@ impl Verdict {
     /// working, and a check that silently stopped running is the failure mode §4.5 cannot otherwise
     /// see. Collapsing them would make "the verifier stopped checking" indistinguishable from "the
     /// verifier refused something", which are opposite situations.
-    #[must_use]
     pub fn unrun_essentials(&self) -> Vec<Check> {
         Check::essential()
             .iter()
@@ -195,6 +194,7 @@ impl Verdict {
     /// This is the **trust** question, and for it the two cases are equivalent: neither establishes
     /// what the check was there to establish. For the *diagnostic* question, which tells a
     /// regression from a refusal, use [`Verdict::unrun_essentials`].
+    #[must_use]
     pub fn missing_essentials(&self) -> Vec<Check> {
         Check::essential()
             .iter()

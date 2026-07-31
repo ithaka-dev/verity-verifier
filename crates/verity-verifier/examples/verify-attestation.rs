@@ -13,6 +13,11 @@
 //! **both** directions. A run that only ever sees the good case cannot tell "the check passed" from
 //! "the check did not run".
 
+// A CLI, not library code. `expect` on a missing argument *is* the correct behaviour here — the
+// caller gets a clear message and a non-zero exit — and the library's blanket denial of it exists
+// to stop panics reaching an embedder, which an example has none of.
+#![allow(clippy::expect_used, clippy::indexing_slicing)]
+
 use std::process::ExitCode;
 
 use verity_verifier::attest::{Collateral, TcbPolicy};
@@ -122,9 +127,10 @@ async fn main() -> ExitCode {
     }
 }
 
+#[must_use]
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
