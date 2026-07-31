@@ -33,3 +33,13 @@ ureq = { workspace = true, optional = true }
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+# For `examples/verify-attestation.rs` only. The library performs no I/O and chooses no async
+# runtime — that is deliberate, so verification can run offline, in wasm32, or inside another
+# enclave. The example fetches collateral, so it needs both; a dev-dependency keeps that cost off
+# every embedder.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+dcap-qvl = { workspace = true }
+
+[[example]]
+name = "verify-attestation"
+required-features = ["attest"]
