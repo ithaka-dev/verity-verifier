@@ -131,8 +131,22 @@ impl TcbPolicy {
         }
     }
 
-    fn permits(&self, status: &str) -> bool {
+    /// Whether this policy accepts a given TCB status.
+    ///
+    /// Public because the decision is worth inspecting rather than only observing. A caller can ask
+    /// before verifying, or explain a refusal afterwards — and it makes the policy directly
+    /// testable, which matters because ADR 0014 makes TCB enforcement mandatory and the mechanism
+    /// was previously reachable only through a verification requiring live Intel collateral. A rule
+    /// that can only be exercised against the network is a rule with no unit test.
+    ///
+    /// Case-insensitive: Intel's casing is not something a caller should have to match exactly.
+    #[must_use]
+    pub fn accepts(&self, status: &str) -> bool {
         self.accepted.iter().any(|a| a.eq_ignore_ascii_case(status))
+    }
+
+    fn permits(&self, status: &str) -> bool {
+        self.accepts(status)
     }
 }
 

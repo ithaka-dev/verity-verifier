@@ -114,3 +114,161 @@ fn minimal_collateral() -> verity_verifier::attest::Collateral {
         pck_certificate_chain: None,
     }
 }
+
+// — T-01: the mechanism ADR 0014 makes mandatory —
+//
+// Until these existed, the policy was asserted only by *identity* — that the default equalled
+// `up_to_date_only()` — and never by *behaviour*. Nothing demonstrated it refusing anything,
+// because the predicate was private and reachable only through a verification needing live Intel
+// collateral. A rule exercised only against the network has no unit test.
+
+/// The refusal the whole policy exists for.
+#[test]
+fn the_default_policy_refuses_every_degraded_status() {
+    let policy = TcbPolicy::default();
+    assert!(policy.accepts("UpToDate"));
+
+    // Every status Intel actually emits other than UpToDate. Each means the platform is running
+    // with known weaknesses, and accepting one silently is the outcome ADR 0014 forbids.
+    for degraded in [
+        "OutOfDate",
+        "OutOfDateConfigurationNeeded",
+        "SWHardeningNeeded",
+        "ConfigurationNeeded",
+        "ConfigurationAndSWHardeningNeeded",
+        "Revoked",
+    ] {
+        assert!(
+            !policy.accepts(degraded),
+            "{degraded} must be refused by default"
+        );
+    }
+}
+
+/// An unknown status is refused rather than treated as benign. A status this crate has never heard
+/// of is a status it cannot reason about, and the safe reading of "I do not know" is "no".
+#[test]
+fn an_unrecognised_status_is_refused() {
+    let policy = TcbPolicy::default();
+    for unknown in ["", "Fine", "UpToDateish", "UPTODATE_BUT_ACTUALLY_NOT", "🙂"] {
+        assert!(!policy.accepts(unknown), "{unknown:?} must be refused");
+    }
+}
+
+/// Widening accepts exactly what it names and nothing adjacent.
+#[test]
+fn accepting_widens_only_what_it_names() {
+    let policy = TcbPolicy::accepting(["SWHardeningNeeded".to_owned()]);
+
+    assert!(policy.accepts("SWHardeningNeeded"));
+    // Not even UpToDate, unless it was named — the list is the whole policy, not an addition to a
+    // default. A caller who forgets that gets a refusal, which is the safe direction.
+    assert!(!policy.accepts("UpToDate"));
+    assert!(!policy.accepts("ConfigurationAndSWHardeningNeeded"));
+    assert!(!policy.accepts("OutOfDate"));
+}
+
+/// Intel's casing is not something a caller should have to match exactly.
+#[test]
+fn status_comparison_is_case_insensitive() {
+    let policy = TcbPolicy::default();
+    for spelling in ["uptodate", "UPTODATE", "UpToDate", "uPtOdAtE"] {
+        assert!(policy.accepts(spelling), "{spelling} must be accepted");
+    }
+}
+
+/// An empty policy accepts nothing. There is deliberately no "accept anything" constructor, so this
+/// is the most permissive mistake available and it fails closed.
+#[test]
+fn an_empty_policy_accepts_nothing() {
+    let policy = TcbPolicy::accepting(Vec::new());
+    for status in ["UpToDate", "OutOfDate", ""] {
+        assert!(!policy.accepts(status));
+    }
+}
+
+// — T-02: the two failure kinds must stay distinguishable —
+
+/// **Genuine-but-out-of-date and not-genuine call for completely different responses**, and
+/// collapsing them into one error would hide which happened: one means update the platform, the
+/// other means do not trust this endpoint at all.
+#[test]
+fn tcb_failure_and_signature_failure_are_different_errors() {
+    let tcb = AttestError::TcbUnacceptable {
+        status: "OutOfDate".to_owned(),
+        advisory_ids: vec!["INTEL-SA-00615".to_owned()],
+    };
+    let signature = AttestError::SignatureInvalid {
+        detail: "chain did not verify".to_owned(),
+    };
+
+    assert_ne!(tcb, signature);
+    assert!(!matches!(tcb, AttestError::SignatureInvalid { .. }));
+    assert!(!matches!(signature, AttestError::TcbUnacceptable { .. }));
+}
+
+/// Advisories are surfaced rather than swallowed: a caller deciding how much to trust an endpoint
+/// should be able to see what Intel has published about the platform.
+#[test]
+fn a_tcb_refusal_names_the_status_and_its_advisories() {
+    let rendered = AttestError::TcbUnacceptable {
+        status: "OutOfDate".to_owned(),
+        advisory_ids: vec!["INTEL-SA-00615".to_owned(), "INTEL-SA-00657".to_owned()],
+    }
+    .to_string();
+
+    assert!(rendered.contains("OutOfDate"), "{rendered}");
+    assert!(rendered.contains("INTEL-SA-00615"), "{rendered}");
+    assert!(rendered.contains("INTEL-SA-00657"), "{rendered}");
+}
+
+/// No advisories is a clean message rather than an empty bracket — the absence of advisories is
+/// itself information, and it should not read like a formatting bug.
+#[test]
+fn a_tcb_refusal_without_advisories_reads_cleanly() {
+    let rendered = AttestError::TcbUnacceptable {
+        status: "Revoked".to_owned(),
+        advisory_ids: Vec::new(),
+    }
+    .to_string();
+
+    assert!(rendered.contains("Revoked"));
+    assert!(!rendered.contains("()"), "{rendered}");
+    assert!(!rendered.contains("advisories"), "{rendered}");
+}
+
+/// A tampered quote must be refused as a signature failure — not accepted, and not misreported as
+/// a TCB problem.
+#[test]
+fn a_tampered_quote_is_refused_as_a_signature_failure() {
+    let collateral = minimal_collateral();
+    let mut tampered = quote_bytes();
+
+    // Flip a byte deep in the signature region rather than in the header, so the quote still parses
+    // and the failure is genuinely the signature rather than the shape.
+    let position = tampered.len() - 64;
+    tampered[position] ^= 0b0000_0001;
+
+    match verity_verifier::attest::verify_quote(&tampered, &collateral, 0, &TcbPolicy::default()) {
+        Err(AttestError::SignatureInvalid { .. }) => {}
+        other => panic!("expected SignatureInvalid, got {other:?}"),
+    }
+}
+
+/// A truncated quote is refused rather than panicking. Every read in the parser is fallible for
+/// exactly this reason: malformed input arrives from the network.
+#[test]
+fn a_truncated_quote_is_refused_rather_than_panicking() {
+    let collateral = minimal_collateral();
+    let full = quote_bytes();
+
+    for fraction in [1, 2, 4, 8, 16] {
+        let truncated = &full[..full.len() / fraction];
+        let result =
+            verity_verifier::attest::verify_quote(truncated, &collateral, 0, &TcbPolicy::default());
+        assert!(
+            result.is_err(),
+            "a {fraction}-way truncation must be refused"
+        );
+    }
+}
