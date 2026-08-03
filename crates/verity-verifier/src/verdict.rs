@@ -63,6 +63,18 @@ impl Check {
     ///
     /// A verifier reporting success while having skipped any of these has not verified anything,
     /// whatever it says.
+    ///
+    /// **`TcbStatus` belongs here and was missing.** ADR 0014 decision 2 makes TCB enforcement
+    /// mandatory and not configurable — "no option, no override, no strict mode that can be left
+    /// off" — and `verify` does record the refusal. But recording it outside this list meant the
+    /// refusal never reached `is_trustworthy`, so a genuine quote from a platform with a known
+    /// TCB weakness returned `true`. The enforcement was honest in the transcript and absent from
+    /// the answer, which is the precise shape ADR 0014 exists to prevent.
+    ///
+    /// **`BootMeasurements` is deliberately not here.** It compares against a reference the caller
+    /// supplies and most callers have none, so its absence is a legitimate configuration rather
+    /// than a gap. That is the line, and `TcbStatus` was on the wrong side of it: TCB status always
+    /// has an answer whenever a signature verified.
     #[must_use]
     pub const fn essential() -> &'static [Self] {
         &[
@@ -70,6 +82,7 @@ impl Check {
             Self::ImagesPinned,
             Self::LicensedImagePresent,
             Self::QuoteSignature,
+            Self::TcbStatus,
             Self::MrConfigId,
         ]
     }
@@ -168,12 +181,6 @@ impl Verdict {
             .collect()
     }
 
-    /// Essential checks that did not pass — whether they failed or were never run.
-    ///
-    /// The two are grouped on purpose. From the position of someone deciding whether to trust an
-    /// endpoint, "this check failed" and "nobody ran this check" are the same answer: **you do not
-    /// know.**
-    #[must_use]
     /// Essential checks that **never ran at all** — no outcome was recorded for them.
     ///
     /// Distinct from [`Verdict::missing_essentials`], which also includes checks that ran and
@@ -181,6 +188,7 @@ impl Verdict {
     /// working, and a check that silently stopped running is the failure mode §4.5 cannot otherwise
     /// see. Collapsing them would make "the verifier stopped checking" indistinguishable from "the
     /// verifier refused something", which are opposite situations.
+    #[must_use]
     pub fn unrun_essentials(&self) -> Vec<Check> {
         Check::essential()
             .iter()
