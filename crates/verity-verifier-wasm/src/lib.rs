@@ -170,17 +170,39 @@ pub fn verify_compose_only(
     licensed_image_digest: &str,
     raw_quote: &[u8],
 ) -> Result<JsValue, JsValue> {
+    verdict_to_value(&compose_only_verdict(
+        document,
+        licensed_compose_hash_hex,
+        licensed_image_digest,
+        raw_quote,
+    ))
+}
+
+/// The decisions behind [`verify_compose_only`], separated from the JavaScript boundary.
+///
+/// Split out because `JsValue` only exists on wasm32, so while this logic lived inside the exported
+/// function it could not be executed by any test on a development machine — and this crate is built
+/// for wasm32 in CI but never run anywhere. That is why these bindings sat at 21% coverage while
+/// the core they wrap was at 79%: not because the code was hard to test, but because it was welded
+/// to a type that cannot exist natively.
+///
+/// The distribution surface matters more than the percentage. ADR 0012 ships three of these — Rust
+/// crate, WASM, Node bindings — and ADR 0014 notes each has its own version and its own opportunity
+/// to lag. A binding that disagrees with the core about what "trustworthy" means is the failure
+/// nobody would see, because the core's own tests all pass.
+fn compose_only_verdict(
+    document: &[u8],
+    licensed_compose_hash_hex: &str,
+    licensed_image_digest: &str,
+    raw_quote: &[u8],
+) -> verity_verifier::verdict::Verdict {
     use verity_verifier::verdict::{Check, Verdict};
 
     let mut verdict = Verdict::new();
 
     let licensed = match ComposeHash::parse_hex(licensed_compose_hash_hex) {
         Ok(h) => h,
-        Err(e) => {
-            return verdict_to_value(
-                &verdict.record(Check::ComposeHash, Outcome::Failed(e.to_string())),
-            )
-        }
+        Err(e) => return verdict.record(Check::ComposeHash, Outcome::Failed(e.to_string())),
     };
 
     match verity_verifier::binding::VerifiedCompose::check(document.to_vec(), &licensed) {
@@ -221,12 +243,228 @@ pub fn verify_compose_only(
         Err(e) => verdict = verdict.record(Check::MrConfigId, Outcome::Failed(e.to_string())),
     }
 
-    verdict = verdict.record(
-        Check::QuoteSignature,
-        Outcome::Skipped(
-            "signature verification needs Intel collateral; use the Rust API".to_owned(),
-        ),
-    );
+    // Both, and explicitly. `TcbStatus` used to be omitted rather than recorded, which left it as
+    // a check that *never ran* — and `unrun_essentials` treats that as the signal that a verifier
+    // silently stopped checking, which is the one thing ADR 0014 is built to surface. Here it is a
+    // legitimate, structural omission: TCB status is a property of the platform that signed the
+    // quote, so it cannot be judged without the collateral needed to verify that signature. Saying
+    // so keeps an honest skip distinguishable from a regression.
+    let needs_collateral = "needs Intel collateral; use the Rust API".to_owned();
+    verdict
+        .record(
+            Check::QuoteSignature,
+            Outcome::Skipped(format!("signature verification {needs_collateral}")),
+        )
+        .record(
+            Check::TcbStatus,
+            Outcome::Skipped(format!("TCB status {needs_collateral}")),
+        )
+}
 
-    verdict_to_value(&verdict)
+#[cfg(test)]
+mod tests {
+    //! T-12: the verdict logic, which no test could previously reach.
+    //!
+    //! `verify_compose_only` returned `Result<JsValue, JsValue>`, and `JsValue` exists only on
+    //! wasm32 — so every decision inside it was unreachable from a native test. Splitting
+    //! `compose_only_verdict` out from the serialisation is what makes these possible; the exported
+    //! function is now a one-line wrapper with nothing left to get wrong.
+
+    // These live inside the crate, so the workspace lints apply — including the ones that exist to
+    // stop library code panicking. In a test a panic is the reporting mechanism, so indexing a
+    // fixture directly is the clearer expression: an out-of-range index fails the test loudly,
+    // which is what should happen.
+    #![allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::{compose_only_verdict, to_js};
+    use verity_verifier::verdict::{Check, Outcome, Verdict};
+
+    const COMPOSE: &[u8] =
+        include_bytes!("../../verity-verifier/tests/fixtures/app-compose-0.5.7.json");
+    const QUOTE_HEX: &str =
+        include_str!("../../verity-verifier/tests/fixtures/quote-v4-dstack-0.5.7.hex");
+    const LICENSED: &str = "64690ef38b54187da11a41a54905f5f539e948a0414ceb312c8036c82f6529fd";
+    const IMAGE: &str = "sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc";
+
+    fn quote() -> Vec<u8> {
+        let hex = QUOTE_HEX.trim();
+        (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("fixture is hex"))
+            .collect()
+    }
+
+    fn outcome_of(verdict: &Verdict, check: Check) -> Option<&Outcome> {
+        verdict.outcome(check)
+    }
+
+    /// **The most important property in this crate**, and it had no test: a compose-only verdict is
+    /// never trustworthy. These bindings cannot verify a signature — the dependency that does it
+    /// will not build for wasm32 — so the one thing they must never do is return a verdict that
+    /// reads as verified. The refusal is structural rather than a policy someone could relax.
+    #[test]
+    fn a_compose_only_verdict_is_never_trustworthy_even_when_everything_it_can_check_passes() {
+        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, &quote());
+
+        assert_eq!(
+            outcome_of(&verdict, Check::ComposeHash),
+            Some(&Outcome::Passed)
+        );
+        assert_eq!(
+            outcome_of(&verdict, Check::ImagesPinned),
+            Some(&Outcome::Passed)
+        );
+        assert_eq!(
+            outcome_of(&verdict, Check::LicensedImagePresent),
+            Some(&Outcome::Passed)
+        );
+        assert_eq!(
+            outcome_of(&verdict, Check::MrConfigId),
+            Some(&Outcome::Passed)
+        );
+
+        assert!(
+            !verdict.is_trustworthy(),
+            "everything checkable passed, and that is still not verification"
+        );
+    }
+
+    /// The skips must be *recorded*, not merely absent. `unrun_essentials` treats an absent check
+    /// as the signal that a verifier silently stopped checking — the regression ADR 0014 exists to
+    /// surface — so an honest structural omission has to say so explicitly to stay distinguishable
+    /// from one. `TcbStatus` was absent here until T-11 made it essential.
+    #[test]
+    fn what_these_bindings_cannot_check_is_recorded_as_skipped_rather_than_left_out() {
+        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, &quote());
+
+        for check in [Check::QuoteSignature, Check::TcbStatus] {
+            match outcome_of(&verdict, check) {
+                Some(Outcome::Skipped(why)) => {
+                    assert!(
+                        why.contains("collateral"),
+                        "{check} must say why it was skipped"
+                    );
+                }
+                other => panic!("{check} must be recorded as skipped, was {other:?}"),
+            }
+        }
+        assert!(
+            verdict.unrun_essentials().is_empty(),
+            "a declared skip is not the same as a check that vanished"
+        );
+    }
+
+    /// A compose that does not hash to the licensed value stops the examination: its contents are
+    /// not evidence of anything, so reporting on them would be reporting on an attacker's document.
+    #[test]
+    fn a_wrong_compose_skips_the_checks_that_depend_on_it_rather_than_failing_them() {
+        let mut tampered = COMPOSE.to_vec();
+        tampered.push(b' ');
+        let verdict = compose_only_verdict(&tampered, LICENSED, IMAGE, &quote());
+
+        assert!(matches!(
+            outcome_of(&verdict, Check::ComposeHash),
+            Some(Outcome::Failed(_))
+        ));
+        assert!(matches!(
+            outcome_of(&verdict, Check::ImagesPinned),
+            Some(Outcome::Skipped(_))
+        ));
+        assert!(matches!(
+            outcome_of(&verdict, Check::LicensedImagePresent),
+            Some(Outcome::Skipped(_))
+        ));
+        assert!(!verdict.is_trustworthy());
+    }
+
+    /// An unparseable licensed hash must not be treated as "nothing to compare against". It is the
+    /// caller's input, and a verifier that shrugged at it would pass every deployment.
+    #[test]
+    fn an_unreadable_licensed_hash_fails_the_compose_check_immediately() {
+        let verdict = compose_only_verdict(COMPOSE, "not-a-hash", IMAGE, &quote());
+        assert!(matches!(
+            outcome_of(&verdict, Check::ComposeHash),
+            Some(Outcome::Failed(_))
+        ));
+        assert!(!verdict.is_trustworthy());
+    }
+
+    #[test]
+    fn an_unparseable_quote_fails_the_binding_check() {
+        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, b"not a quote");
+        assert!(matches!(
+            outcome_of(&verdict, Check::MrConfigId),
+            Some(Outcome::Failed(_))
+        ));
+        assert!(!verdict.is_trustworthy());
+    }
+
+    /// A tag-referenced image (ADR 0007) fails while the hash still matches — the case that keeps
+    /// `composeHash` stable while the code inside changes freely.
+    #[test]
+    fn a_pinned_hash_does_not_excuse_an_unpinned_image() {
+        let tagged = serde_json::to_vec(&serde_json::json!({
+            "manifest_version": 2,
+            "runner": "docker-compose",
+            "docker_compose_file": "services:\n  app:\n    image: alpine:latest\n",
+        }))
+        .expect("json");
+        let its_hash = super::ComposeHash::of(&tagged).to_string();
+
+        let verdict = compose_only_verdict(&tagged, &its_hash, IMAGE, &quote());
+        assert_eq!(
+            outcome_of(&verdict, Check::ComposeHash),
+            Some(&Outcome::Passed),
+            "the document really is the one named"
+        );
+        assert!(
+            matches!(
+                outcome_of(&verdict, Check::ImagesPinned),
+                Some(Outcome::Failed(_))
+            ),
+            "and it is still refused, because a tag is not a pin"
+        );
+    }
+
+    // — the JavaScript projection —
+
+    /// The mapping into the JavaScript shape must not lose the distinction between the three
+    /// outcomes, since that shape is all a JavaScript caller ever sees.
+    #[test]
+    fn the_js_projection_preserves_pass_fail_and_skip() {
+        let verdict = Verdict::new()
+            .record(Check::ComposeHash, Outcome::Passed)
+            .record(Check::ImagesPinned, Outcome::Failed("tagged".to_owned()))
+            .record(Check::MrConfigId, Outcome::Skipped("no quote".to_owned()));
+        let js = to_js(&verdict);
+
+        assert_eq!(js.checks[0].outcome, "passed");
+        assert_eq!(js.checks[0].detail, None, "a pass has nothing to explain");
+        assert_eq!(js.checks[1].outcome, "failed");
+        assert_eq!(js.checks[1].detail.as_deref(), Some("tagged"));
+        assert_eq!(js.checks[2].outcome, "skipped");
+        assert_eq!(js.checks[2].detail.as_deref(), Some("no quote"));
+        assert!(!js.is_trustworthy);
+    }
+
+    /// Check names cross the boundary unchanged: they are the identifiers JavaScript groups and
+    /// alerts on, so a binding that renamed them would break telemetry silently.
+    #[test]
+    fn the_js_projection_carries_names_provenance_and_what_is_missing() {
+        let js = to_js(&compose_only_verdict(COMPOSE, LICENSED, IMAGE, &quote()));
+
+        assert!(js.checks.iter().any(|c| c.check == "compose_hash"));
+        assert!(!js.verifier_version.is_empty());
+        assert!(!js.reference_data_date.is_empty());
+        assert!(
+            js.missing_essentials
+                .contains(&"quote_signature".to_owned()),
+            "the JavaScript caller must be told what was not established, by name"
+        );
+        assert!(js.missing_essentials.contains(&"tcb_status".to_owned()));
+    }
 }
