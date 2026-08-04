@@ -20,8 +20,35 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --all-features
+      # `-D warnings`, which this step was missing. `clippy::all` is denied in the workspace
+      # manifest and would have failed the build anyway — but `unwrap_used`, `expect_used`, `panic`
+      # and `indexing_slicing` are set to `warn`, and those are the ones that exist to keep this
+      # crate from panicking. Without the flag they were advisory in CI: a `.unwrap()` on
+      # attacker-influenced bytes would have warned and passed.
+      #
+      # ADR 0014's reasoning is why that matters here specifically — a verifier that panics gets
+      # wrapped in catch-and-continue by whoever embeds it, which arrives at the same place as
+      # loosening a check.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+
+  # Coverage cannot tell an assertion from a bystander. `verity-contracts` has the receipt — its
+  # invariant suite once scored 2 of 12 while coverage looked healthy — and the stakes are higher
+  # here: a weakened contract is visible on chain and replaceable, a weakened verifier ships inside
+  # every agent and by ADR 0014 is less patchable than the app template.
+  #
+  # A surviving mutant fails the build. So does a mutant that cannot be applied, because a mutant
+  # silently absent leaves the score looking complete while a behaviour went unchecked. And the
+  # baseline is proved green before any mutant is scored — without that check every mutant "dies"
+  # for free, which is exactly how the contracts harness came to report 15/15 having run no tests.
+  mutation:
+    name: mutation score
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: ./script/mutate.sh
 
   fetch:
     name: fetch (against a real IPFS node)

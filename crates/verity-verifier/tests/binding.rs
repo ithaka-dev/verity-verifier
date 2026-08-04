@@ -196,3 +196,66 @@ fn refuses_wrong_length_and_non_hex() {
         Err(HashParseError::NotHex)
     );
 }
+
+/// **A compose hash differing only in its last byte is still a mismatch.**
+///
+/// Found by `script/mutate.sh`. Comparing only the first half of `MR-CONFIG-ID` — one plausible
+/// edit, and precisely the shape ADR 0009 rule 3 forbids — passed the entire suite, because every
+/// mismatch test until now altered a byte near the *front* of the hash.
+///
+/// The layout is why that mattered: `0x01 ‖ composeHash ‖ 0x00 × 15`, so the first 16 bytes of a
+/// measurement are the prefix plus only the first 15 bytes of the hash. A configuration differing
+/// anywhere in the remaining 17 would have compared equal, and "compared equal" here means a
+/// deployment running something other than what was licensed is accepted.
+///
+/// Nobody deletes a check. They weaken a comparison, usually while making a stubborn test pass.
+#[test]
+fn a_compose_hash_differing_only_in_its_tail_is_still_a_mismatch() {
+    let quote = Quote::parse_hex(QUOTE_HEX).expect("quote");
+
+    // The licensed hash with its final nibble changed, and nothing else.
+    let mut tail_altered: Vec<char> = LICENSED.chars().collect();
+    let last = tail_altered.len() - 1;
+    tail_altered[last] = if tail_altered[last] == 'd' { 'e' } else { 'd' };
+    let altered: String = tail_altered.into_iter().collect();
+    assert_ne!(altered, LICENSED);
+    assert_eq!(
+        &altered[..48],
+        &LICENSED[..48],
+        "the first 24 bytes are identical"
+    );
+
+    let other = ComposeHash::parse_hex(&altered).expect("hash");
+    match check_mrconfigid(quote.mrconfigid(), &other) {
+        Err(MrConfigIdError::Mismatch { expected, measured }) => {
+            assert_ne!(expected, measured);
+            assert_eq!(
+                expected.as_bytes()[..16],
+                measured.as_bytes()[..16],
+                "identical for 16 bytes — which is exactly why a prefix comparison missed this"
+            );
+        }
+        other => panic!("a one-byte difference anywhere must be a mismatch, got {other:?}"),
+    }
+}
+
+/// The same property stated across the whole hash: altering *any* byte of the licensed
+/// configuration must be refused, not just the ones a hand-written case happened to pick.
+#[test]
+fn altering_any_single_byte_of_the_licensed_hash_is_refused() {
+    let quote = Quote::parse_hex(QUOTE_HEX).expect("quote");
+
+    for position in 0..32 {
+        let mut bytes = *ComposeHash::parse_hex(LICENSED).expect("hash").as_bytes();
+        bytes[position] ^= 0x01;
+        let altered = ComposeHash::from_bytes(bytes);
+
+        assert!(
+            matches!(
+                check_mrconfigid(quote.mrconfigid(), &altered),
+                Err(MrConfigIdError::Mismatch { .. })
+            ),
+            "a difference at byte {position} must be refused"
+        );
+    }
+}
