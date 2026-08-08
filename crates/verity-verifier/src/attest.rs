@@ -144,10 +144,6 @@ impl TcbPolicy {
     pub fn accepts(&self, status: &str) -> bool {
         self.accepted.iter().any(|a| a.eq_ignore_ascii_case(status))
     }
-
-    fn permits(&self, status: &str) -> bool {
-        self.accepts(status)
-    }
 }
 
 /// Verify a quote's signature chain against Intel, using supplied collateral.
@@ -174,7 +170,7 @@ pub fn verify_quote(
     let status = report.status.clone();
     let advisory_ids = report.advisory_ids.clone();
 
-    if !policy.permits(&status) {
+    if !policy.accepts(&status) {
         return Err(AttestError::TcbUnacceptable {
             status,
             advisory_ids,

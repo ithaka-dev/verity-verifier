@@ -32,6 +32,39 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
 
+  # T-18. Coverage was never measured in CI here at all: every number quoted for this crate came
+  # from somebody's laptop, so nothing would have noticed it sliding from 90% back to 70%.
+  #
+  # Floors sit just below current, so a regression trips them and an honest commit does not have to
+  # argue with the gate. **Raise them as coverage improves; never lower one to make a build pass.**
+  # If a change genuinely justifies a lower floor, that belongs in the commit message where a
+  # reviewer sees it.
+  #
+  # `--fail-under-file-lines` is the one that matters most here, and it is not redundant with the
+  # total. A total hides exactly the failure this project has already had: a module going dark while
+  # the average stays healthy. Three modules in the template sat fully untested behind a 98% that
+  # way. A per-file floor also means a *new* module cannot arrive with no tests at all.
+  #
+  # 60 is low, and honestly so: `attest.rs` sits at 63% because `Attested`'s accessors are reachable
+  # only through `verify_quote`, which needs live Intel collateral. That is correct design — a
+  # proof-carrying type should not have a public constructor — so the floor reflects it rather than
+  # the type being weakened to raise a number.
+  coverage:
+    name: coverage floors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: |
+          cargo llvm-cov --all-features --summary-only \
+            --fail-under-lines 89 \
+            --fail-under-functions 88 \
+            --fail-under-file-lines 60
+
   # Coverage cannot tell an assertion from a bystander. `verity-contracts` has the receipt — its
   # invariant suite once scored 2 of 12 while coverage looked healthy — and the stakes are higher
   # here: a weakened contract is visible on chain and replaceable, a weakened verifier ships inside
