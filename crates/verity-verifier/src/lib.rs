@@ -8,6 +8,28 @@
 //! This crate is scaffolding. **No result it produces means anything yet.** Do not wire it into
 //! anything that makes a trust decision until this notice is removed and a version is tagged.
 //!
+//! ## Specifically: there is no channel binding, and its absence is not visible in a verdict
+//!
+//! Every check this crate performs treats the TDX quote as a **detached artifact**. Nothing ties
+//! the quote to the connection an agent actually opens, so a genuine quote recorded from one CVM —
+//! including one that has since been destroyed — paired with an endpoint an attacker controls
+//! passes every essential check and yields `is_trustworthy() == true`.
+//!
+//! This needs no man-in-the-middle and no network position: a hostile or buggy orchestrator
+//! returning a real `cvm_id`'s quote beside its own endpoint is sufficient. The agent then sends
+//! the holder's data to the attacker while `licensed_composeHash == attested_composeHash` holds
+//! throughout, and while every invariant the design states reads as satisfied.
+//!
+//! The primitive that closes this exists — dStack's RA-TLS commits the TLS key into the quote's
+//! `report_data`, which [`quote::Quote::report_data`] now parses — but **the comparison is not
+//! implemented**, `Evidence` cannot yet carry a certificate, and `ChannelBound` is not in
+//! [`verdict::Check::essential`]. Until all three land, treat a trustworthy verdict from this crate
+//! as establishing *what is running somewhere*, never *what you are talking to*.
+//!
+//! Tracked as CR-1 of the 2026-08-09 system-design review. The refusal this crate cannot yet
+//! produce is demonstrated by `verity-foundation/closed-loop/06-refuses-relayed-endpoint.sh`,
+//! which is expected to fail until the check exists.
+//!
 //! # The three rules
 //!
 //! Recorded here because they are the ones violated under deadline pressure, and because a reader

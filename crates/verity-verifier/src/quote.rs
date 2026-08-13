@@ -9,6 +9,9 @@ use core::fmt;
 /// Length of a TDX measurement register, in bytes.
 pub const MEASUREMENT_LEN: usize = 48;
 
+/// Length of the TD report's `report_data` field, in bytes.
+pub const REPORT_DATA_LEN: usize = 64;
+
 /// Quote header length, in bytes.
 const HEADER_LEN: usize = 48;
 
@@ -37,6 +40,29 @@ const OFF_RTMR0: usize = 328;
 const OFF_RTMR1: usize = 376;
 const OFF_RTMR2: usize = 424;
 const OFF_RTMR3: usize = 472;
+const OFF_REPORTDATA: usize = 520;
+
+// The offsets above are one contiguous run, so pin them as a chain rather than as nine independent
+// literals. A single mistyped digit then fails to compile instead of silently reading a neighbouring
+// register — and a register read at the wrong offset fails *closed*, which is safe but produces a
+// mismatch no error message can explain.
+const _: () = assert!(OFF_MRTD + MEASUREMENT_LEN == OFF_MRCONFIGID);
+const _: () = assert!(OFF_MRCONFIGID + MEASUREMENT_LEN == OFF_MROWNER);
+const _: () = assert!(OFF_MROWNER + MEASUREMENT_LEN == OFF_MROWNERCONFIG);
+const _: () = assert!(OFF_MROWNERCONFIG + MEASUREMENT_LEN == OFF_RTMR0);
+const _: () = assert!(OFF_RTMR0 + MEASUREMENT_LEN == OFF_RTMR1);
+const _: () = assert!(OFF_RTMR1 + MEASUREMENT_LEN == OFF_RTMR2);
+const _: () = assert!(OFF_RTMR2 + MEASUREMENT_LEN == OFF_RTMR3);
+const _: () = assert!(OFF_RTMR3 + MEASUREMENT_LEN == OFF_REPORTDATA);
+
+// `report_data` ends the **v1.0** report body this crate parses, and only that one.
+//
+// Do not read this as "report_data is the last field of a TD report". In the TDX 1.5 body — 648
+// bytes, reached through quote v5 — `report_data` stays at offset 520 and `tee_tcb_svn2` and
+// `mrservicetd` are appended *after* it. Whoever adds v5 support will trip this assertion, and the
+// right response is to give v5 its own `REPORT_LEN`, not to move `OFF_REPORTDATA`. Quote v5 is
+// rejected in `parse` before any of this is reached, so today the narrow reading is the true one.
+const _: () = assert!(OFF_REPORTDATA + REPORT_DATA_LEN == REPORT_LEN);
 
 /// A 48-byte TDX measurement.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,6 +94,63 @@ impl Measurement {
     #[must_use]
     pub fn is_zero(&self) -> bool {
         self.0.iter().all(|b| *b == 0)
+    }
+}
+
+/// The TD report's 64-byte `report_data` — what the enclave asked the hardware to sign *for it*.
+///
+/// Every other field in a quote is measured by the platform. This one is supplied by the workload,
+/// which is what makes it the only place a quote can be tied to something outside itself. dStack's
+/// RA-TLS puts a commitment to the TLS key here, so that a quote proves something about a *live
+/// connection* rather than merely about a machine.
+///
+/// **Parsing this is not checking it.** Reading the field establishes nothing on its own — the
+/// comparison against the connection's certificate is what makes the quote non-detachable, and
+/// until that check exists a populated `report_data` is decoration. See [`crate`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReportData([u8; REPORT_DATA_LEN]);
+
+impl ReportData {
+    /// From raw bytes.
+    ///
+    /// Public so an *expected* commitment can be constructed for comparison. Constructing one does
+    /// not assert it came from a quote — only [`Quote::parse`] does that.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; REPORT_DATA_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; REPORT_DATA_LEN] {
+        &self.0
+    }
+
+    /// True when every byte is zero.
+    ///
+    /// Worth checking explicitly, and more so here than for a measurement. A workload is free to
+    /// leave `report_data` empty — a quote requested for some purpose other than RA-TLS carries
+    /// exactly this — and an all-zero field would compare equal to an expected value someone also
+    /// left empty. A channel-binding check must treat "the enclave committed to nothing" as a
+    /// refusal to establish the binding, never as a binding to nothing.
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.0.iter().all(|b| *b == 0)
+    }
+}
+
+impl fmt::Debug for ReportData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for ReportData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
     }
 }
 
@@ -154,6 +237,7 @@ pub struct Quote {
     mrowner: Measurement,
     mrownerconfig: Measurement,
     rtmr: [Measurement; 4],
+    report_data: ReportData,
 }
 
 impl Quote {
@@ -252,6 +336,19 @@ impl Quote {
             Ok(Measurement(s))
         };
 
+        // Read inline rather than through `measurement`, which is fixed at 48 bytes. A const-generic
+        // `measurement::<N>` would unify the two with the same call-site safety, but at one extra
+        // caller the indirection costs more than the duplication saves.
+        let report_data = {
+            let abs = HEADER_LEN + OFF_REPORTDATA;
+            let s: [u8; REPORT_DATA_LEN] = bytes
+                .get(abs..abs + REPORT_DATA_LEN)
+                .ok_or_else(|| too_short(abs + REPORT_DATA_LEN))?
+                .try_into()
+                .map_err(|_| too_short(abs + REPORT_DATA_LEN))?;
+            ReportData(s)
+        };
+
         Ok(Self {
             version,
             mrtd: measurement(OFF_MRTD)?,
@@ -264,6 +361,7 @@ impl Quote {
                 measurement(OFF_RTMR2)?,
                 measurement(OFF_RTMR3)?,
             ],
+            report_data,
         })
     }
 
@@ -337,6 +435,17 @@ impl Quote {
     #[must_use]
     pub fn rtmr(&self, n: usize) -> Option<&Measurement> {
         self.rtmr.get(n)
+    }
+
+    /// `report_data` — the workload-supplied field RA-TLS commits the TLS key into.
+    ///
+    /// Exposed so a channel-binding check can compare it against the certificate presented on the
+    /// connection actually in use. **A quote read from a file says nothing about a connection**: it
+    /// is this comparison, and only this comparison, that stops a genuine quote from being replayed
+    /// beside an endpoint it never attested.
+    #[must_use]
+    pub const fn report_data(&self) -> &ReportData {
+        &self.report_data
     }
 
     /// All four runtime measurement registers.

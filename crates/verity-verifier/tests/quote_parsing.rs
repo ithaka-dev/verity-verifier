@@ -15,7 +15,7 @@
     clippy::indexing_slicing
 )]
 
-use verity_verifier::quote::{ParseError, Quote, MEASUREMENT_LEN};
+use verity_verifier::quote::{ParseError, Quote, ReportData, MEASUREMENT_LEN, REPORT_DATA_LEN};
 
 const QUOTE_HEX: &str = include_str!("fixtures/quote-v4-dstack-0.5.7.hex");
 const EXPECTED: &str = include_str!("fixtures/quote-v4-dstack-0.5.7.expected.json");
@@ -88,6 +88,155 @@ fn mrowner_fields_are_unpopulated_and_detectably_so() {
     assert!(q.mrowner().is_zero());
     assert!(q.mrownerconfig().is_zero());
     assert!(!q.mrtd().is_zero());
+}
+
+/// `report_data` is the last 64 bytes of the report body, and the parser must read exactly those.
+///
+/// The offset is asserted positionally against the raw fixture rather than against a constant the
+/// parser also uses — an offset compared with itself agrees no matter how wrong it is. The report
+/// body starts at 48 and is 584 long, so the field runs from 48+520 to 48+584.
+#[test]
+fn report_data_is_read_from_the_end_of_the_report_body() {
+    let q = parsed();
+    let bytes = decode(QUOTE_HEX);
+
+    assert_eq!(
+        hex(q.report_data().as_bytes()),
+        hex(&bytes[48 + 520..48 + 584]),
+        "report_data must be the final 64 bytes of the TD report body"
+    );
+}
+
+/// This fixture's quote was issued for a certificate, so its `report_data` carries a key commitment.
+///
+/// Two separate properties, and the second is the one with teeth. That the field is *populated*
+/// matters because an all-zero field would compare equal to an expected value someone left empty,
+/// which is how a channel-binding check comes to pass against nothing.
+///
+/// That the **last 16 bytes** are populated is evidence about the *scheme*: dStack pads a shorter
+/// digest into the 64-byte field, so a SHA-384 commitment would leave exactly this tail zero while
+/// still satisfying every "is it non-empty" assertion. Checking the whole field for any non-zero
+/// byte would have proved nothing beyond the first assertion — the two are the same predicate.
+#[test]
+fn report_data_is_populated_and_fills_the_whole_field() {
+    let q = parsed();
+    assert!(
+        !q.report_data().is_zero(),
+        "a certificate's quote commits to its key; an empty report_data means it did not"
+    );
+    assert!(
+        q.report_data().as_bytes()[48..].iter().any(|b| *b != 0),
+        "a 48-byte digest padded into 64 would leave this tail zero; SHA-512 does not"
+    );
+}
+
+/// A constructed commitment must be comparable to a parsed one.
+///
+/// This is the whole mechanism of the channel-binding check: one side comes from the quote, the
+/// other is computed from the connection's certificate via `from_bytes`. If the two representations
+/// did not compare equal the check could never pass, and if they compared equal too readily it
+/// could never fail.
+#[test]
+fn a_constructed_report_data_compares_against_a_parsed_one() {
+    let q = parsed();
+    let bytes = decode(QUOTE_HEX);
+
+    let expected: [u8; REPORT_DATA_LEN] = bytes[48 + 520..48 + 584]
+        .try_into()
+        .expect("the slice is exactly 64 bytes");
+    assert_eq!(*q.report_data(), ReportData::from_bytes(expected));
+
+    let mut wrong = expected;
+    wrong[63] ^= 0xff;
+    assert_ne!(
+        *q.report_data(),
+        ReportData::from_bytes(wrong),
+        "a differing commitment must not compare equal"
+    );
+}
+
+/// An empty commitment must be detectable as empty however it was obtained.
+///
+/// The channel-binding check has to treat "the enclave committed to nothing" as a refusal to
+/// establish the binding. If a caller ever computes an expected value that comes out all-zero, this
+/// is the predicate that has to stop the two comparing equal.
+#[test]
+fn an_all_zero_commitment_is_detectable() {
+    assert!(ReportData::from_bytes([0u8; REPORT_DATA_LEN]).is_zero());
+    assert!(!parsed().report_data().is_zero());
+}
+
+/// The rendering is load-bearing: it is what a refusal prints when a binding fails.
+///
+/// A mismatch the operator cannot read is a mismatch they will be tempted to dismiss, and the
+/// project's standing instruction is never to loosen a check to resolve one.
+#[test]
+fn report_data_renders_as_lowercase_hex() {
+    let q = parsed();
+    let shown = q.report_data().to_string();
+
+    assert_eq!(shown.len(), REPORT_DATA_LEN * 2, "two hex digits per byte");
+    assert!(
+        shown
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "lowercase hex only, so a value can be grepped against a quote dump"
+    );
+    assert_eq!(
+        shown,
+        format!("{:?}", q.report_data()),
+        "Debug matches Display"
+    );
+    assert_eq!(shown, hex(q.report_data().as_bytes()));
+}
+
+/// A one-byte change to `report_data` must be visible, because that is the granularity an attacker
+/// operates at: a relay's key differs from the enclave's, and nothing guarantees the difference is
+/// large.
+#[test]
+fn a_single_byte_change_to_report_data_is_detectable() {
+    let mut bytes = decode(QUOTE_HEX);
+    let original = Quote::parse(&bytes).expect("fixture parses");
+
+    bytes[48 + 520] ^= 0x01;
+    let altered = Quote::parse(&bytes).expect("still structurally valid");
+
+    assert_ne!(
+        original.report_data(),
+        altered.report_data(),
+        "a flipped bit in report_data must change the parsed value"
+    );
+    assert_eq!(
+        original.rtmrs()[3],
+        altered.rtmrs()[3],
+        "and must not disturb RTMR3, the field immediately before it"
+    );
+    assert_eq!(original.mrconfigid(), altered.mrconfigid());
+}
+
+/// The converse boundary: the byte *before* `report_data` belongs to RTMR3 and must not be read.
+///
+/// Without this, an off-by-one that started the field a byte early would still pass every test
+/// above — the flipped byte would land inside `report_data`, change it, and look correct. Asserting
+/// only that the target moves proves the field overlaps the offset, never that it starts there.
+#[test]
+fn the_byte_before_report_data_belongs_to_rtmr3() {
+    let mut bytes = decode(QUOTE_HEX);
+    let original = Quote::parse(&bytes).expect("fixture parses");
+
+    bytes[48 + 519] ^= 0x01; // last byte of RTMR3
+    let altered = Quote::parse(&bytes).expect("still structurally valid");
+
+    assert_eq!(
+        original.report_data(),
+        altered.report_data(),
+        "report_data must not start one byte early"
+    );
+    assert_ne!(
+        original.rtmrs()[3],
+        altered.rtmrs()[3],
+        "the flipped byte has to land somewhere, and RTMR3 is where"
+    );
 }
 
 #[test]
