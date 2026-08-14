@@ -123,7 +123,13 @@ fn essentials_are_the_checks_without_which_a_verdict_is_meaningless() {
         Check::ImagesPinned,
         Check::LicensedImagePresent,
         Check::QuoteSignature,
+        Check::TcbStatus,
         Check::MrConfigId,
+        // CR-1's check, and the one this list existed without. Covered behaviourally elsewhere
+        // (`channel_binding.rs`, and a mutant that drops it from `essential()`), but this file's
+        // whole job is to pin essentiality against a list written out by hand — so an omission here
+        // is the omission that matters.
+        Check::ChannelBound,
     ] {
         assert!(
             essential.contains(&required),

@@ -81,7 +81,39 @@ proptest = "1"
 pem-rfc7468 = { version = "0.7", features = ["alloc"] }
 # Sync HTTP. Deliberately not an async client: the core verification path does no I/O, and
 # pulling tokio into a library agents embed would leak a runtime choice into their process.
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+#
+# `3.3` rather than `3`: the `connect` feature builds on `ureq::unversioned::transport`, which ureq
+# documents as *"not (yet) follow semver"*. The mitigation is that a breaking change there is a
+# compile error rather than a behaviour change, and a minor floor makes the version that was
+# compiled against explicit.
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+# TLS, driven directly, for the `connect` feature only. Pinned minor like every other
+# cryptography-adjacent dependency here.
+#
+# Three things about this declaration are load-bearing:
+#
+# 1. **`ring`, not `aws-lc-rs`.** The `ring` *crate* is already compiled in every `attest` build —
+#    it is what `dcap-qvl` uses to verify Intel's signature over the quote — so this wires rustls to
+#    a crate already in our trust base and adds none. Binding the crown jewel's TLS to `aws-lc-rs`
+#    would instead make a cmake/NASM toolchain a hard build requirement the moment `dcap-qvl`'s
+#    default `report` feature is trimmed.
+# 2. **This turns on a rustls feature that is currently off.** Today's default build reaches rustls
+#    only through `dcap-qvl` → `reqwest`, which selects `aws-lc-rs`. So a `default + connect` build
+#    compiles *both* providers, and `rustls::ClientConfig::builder()` then panics — see
+#    `connect/tls.rs`, which uses `builder_with_provider` and has a test pinning that.
+# 3. **`tls12` is compatibility, not security.** The TLS version is not a lever here: the TLS layer
+#    authenticates nothing about identity on its own, and what does the authenticating —
+#    `verify_tls12_signature` / `verify_tls13_signature` — is delegated to rustls in both cases.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+# `CertificateDer` / `ServerName`. Already non-optional in the graph via `dcap-qvl`; declared here
+# so the `connect` build does not depend on that remaining true.
+rustls-pki-types = "1"
+# Local certificate generation for the `connect` tests, including the custom X.509 extension that
+# carries a TDX quote. Dev-only: nothing shipped generates a certificate.
+#
+# `default-features = false` with `ring`: rcgen's defaults select `aws-lc-rs`, which would drag a
+# cmake/NASM toolchain into CI for a dev-dependency — and `ring` is already compiled here.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 
 [profile.release]
 overflow-checks = true

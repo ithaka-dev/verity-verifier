@@ -18,12 +18,23 @@
 //! [`verdict::Check::ChannelBound`] is in [`verdict::Check::essential`], so a verdict that did not
 //! establish it cannot be trustworthy.
 //!
-//! **The residual, stated plainly: this crate performs no I/O, so it cannot know that the
-//! certificate you handed it is the one your TLS handshake returned.** It verifies that the quote
-//! commits to *that certificate*; it takes your word that the certificate came from the endpoint
-//! being judged. A caller who supplies a certificate obtained from somewhere else gets a truthful
-//! verdict about a connection they are not using. Closing that gap needs a component that dials the
-//! endpoint itself — MA-1's `connect_verified` — and it is not in this crate yet.
+//! ## The provenance gap, and what closes it
+//!
+//! [`verify::verify`] binds a quote to a certificate **it was handed**. Performing no I/O, it cannot
+//! know that certificate came from your TLS handshake — so a caller who supplies one obtained
+//! elsewhere gets a truthful verdict about a connection they are not using. The second half of the
+//! same finding: a [`verdict::Verdict`] can be ignored, so invariant I1 rested on every agent author
+//! remembering `if !verdict.is_trustworthy() { return }`.
+//!
+//! [`connect::connect_verified`] closes both, behind the non-default `connect` feature. It owns the
+//! socket, the handshake, the certificate and the quote; the caller supplies none of them. And a
+//! [`connect::VerifiedClient`] has no public constructor and no path from an untrustworthy verdict,
+//! so the check cannot be skipped by forgetting it. **It is the one to reach for from an agent.**
+//!
+//! **`verify()` is not deprecated by that.** It is the right call for auditors reasoning about
+//! recorded evidence, for pre-purchase inspection where there is no connection yet, and for any
+//! embedder without a TCP stack — offline, `wasm32`, or inside another enclave. That path stays the
+//! default build; the wrapper is additive to it.
 //!
 //! Two more things a reader should not have to discover the hard way:
 //!
@@ -99,6 +110,27 @@
 
 #![doc(html_root_url = "https://docs.rs/verity-verifier")]
 
+// The `connect` feature opens a socket. It cannot build for wasm32 — `ring` has no backend for
+// that target — and, more to the point, it could not do its job there if it did: see the message.
+//
+// This is a deliberate, narrow exception to Cargo's additivity rule, and it is the safe direction.
+// The combination it rejects could not link anyway; all this does is replace a wall of build-script
+// output with a sentence. Keep it in `lib.rs` rather than in `connect.rs` so it is the first thing
+// rustc prints.
+//
+// **CI invariant, and it is load-bearing:** never combine `--all-features` with
+// `--target wasm32-unknown-unknown`. The wasm job builds `-p verity-verifier-wasm`, which depends
+// on this crate with `default-features = false` and enables no feature, so nothing leaks under
+// resolver v2.
+#[cfg(all(feature = "connect", target_arch = "wasm32"))]
+compile_error!(
+    "the `connect` feature opens a TCP socket and performs a TLS handshake; it cannot build for \
+     wasm32. A browser cannot open a raw TLS connection or inspect a peer certificate, so the \
+     provenance `connect_verified` exists to establish is not obtainable there. Use `verify()` \
+     with a certificate your host environment supplies — in Node, \
+     `socket.getPeerX509Certificate().raw`."
+);
+
 #[cfg(feature = "attest")]
 pub mod attest;
 pub mod binding;
@@ -107,8 +139,17 @@ pub mod binding;
 // perform the one check CR-1 is about.
 pub mod channel;
 pub mod compose;
+#[cfg(feature = "connect")]
+pub mod connect;
+// Ungated, and adds no dependency: `endpoint` is string logic and `ratls` needs only the `x509-cert`
+// parse that `channel` already requires. They are the parts of MA-1 that are useful without a
+// socket — classifying an endpoint before deciding to dial it, and reading a quote out of a
+// certificate captured by something else — so gating them behind `connect` would have put pure
+// functions behind a TCP stack.
+pub mod endpoint;
 pub mod images;
 pub mod quote;
+pub mod ratls;
 pub mod reference;
 pub mod verdict;
 #[cfg(feature = "attest")]

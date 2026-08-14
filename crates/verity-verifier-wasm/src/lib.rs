@@ -11,6 +11,27 @@
 //! from the code it wraps would make "which verifier produced this verdict?" unanswerable, which
 //! is the question [ADR 0014] exists to keep answerable.
 //!
+//! # There is no `connect_verified` here, and there cannot be
+//!
+//! The Rust crate's blessed API dials the endpoint itself, so the certificate it checks is provably
+//! the one its own handshake returned. **That is not implementable for `wasm32-unknown-unknown`:** a
+//! browser cannot open a raw TLS connection, and `fetch()` does not expose the peer certificate at
+//! all. Shipping something *called* a verified transport here would be the defect this crate exists
+//! to refuse — an answer that looks authoritative and establishes nothing.
+//!
+//! So a JavaScript caller carries an obligation the Rust caller no longer does:
+//!
+//! - **In Node**, obtain the leaf DER from your own TLS layer —
+//!   `socket.getPeerX509Certificate().raw` on a `tls.TLSSocket` — and pass it as `leafCertDer`. It
+//!   must come from the handshake with the endpoint being judged; nothing here can check that, and
+//!   a certificate obtained anywhere else yields a truthful answer about a connection you are not
+//!   using.
+//! - **In a browser**, this cannot be done at all. `verifyComposeOnly` remains available and its
+//!   verdict is never trustworthy, which is the honest answer rather than a partial one.
+//!
+//! Closing that gap needs a Node-native binding that can own the handshake. It is separate work, and
+//! until it exists this surface's provenance gap is documented rather than closed.
+//!
 //! [ADR 0012]: https://github.com/ithaka-dev/verity-foundation/blob/main/docs/decisions/0012-language-allocation.md
 //! [ADR 0014]: https://github.com/ithaka-dev/verity-foundation/blob/main/docs/decisions/0014-verifier-update-discipline.md
 

@@ -24,11 +24,15 @@
 //!
 //! # What this module does not establish
 //!
-//! **Provenance.** This crate performs no I/O, so it cannot know that the certificate it was handed
+//! **Provenance.** This module performs no I/O, so it cannot know that the certificate it was handed
 //! is the one a TLS handshake actually returned. A caller who passes a certificate fetched from
-//! somewhere else gets a truthful verdict about a connection they are not using. Closing that is
-//! MA-1's `connect_verified`, which owns the handshake; until it lands, the obligation sits with the
-//! caller and is documented on [`PeerCertificate::Presented`] rather than pretended away.
+//! somewhere else gets a truthful verdict about a connection they are not using.
+//!
+//! [`crate::connect::connect_verified`] closes that — it owns the handshake and reads the
+//! certificate out of it — and is the path an agent should use. This module keeps the obligation
+//! documented on [`PeerCertificate::Presented`] rather than pretended away, because the I/O-free
+//! path remains supported for offline audit, for pre-purchase inspection, and for embedders with no
+//! TCP stack.
 //!
 //! **Chain validity.** The leaf is issued by the Dstack App CA and is deliberately *not* chain
 //! validated. Intel's signature over the quote is what establishes authenticity; a CA that vouches
@@ -295,10 +299,13 @@ pub enum ChannelBindError {
 pub enum PeerCertificate<'a> {
     /// DER of the leaf presented on the TLS handshake **with the endpoint being verified**.
     ///
-    /// It must come from *that* handshake. This crate performs no I/O and cannot check its
-    /// provenance, so a certificate obtained anywhere else yields a truthful verdict about a
-    /// connection you are not using. The path that removes this obligation from the caller is
-    /// MA-1's `connect_verified`, which dials the endpoint itself.
+    /// It must come from *that* handshake. Supplying this by hand means taking the obligation on:
+    /// nothing here can check where the bytes came from, so a certificate obtained anywhere else
+    /// yields a truthful verdict about a connection you are not using.
+    ///
+    /// **[`crate::connect::connect_verified`] removes the obligation** by dialling the endpoint
+    /// itself and reading the certificate out of its own handshake. Prefer it whenever there is a
+    /// connection to judge; this variant stays for the cases where there is not.
     ///
     /// dStack's gateway matters here: on `<app_id>-<port>.<domain>` it *terminates* TLS and hands
     /// the client a valid Let's Encrypt certificate for the gateway, so ordinary TLS verification

@@ -77,11 +77,29 @@ fn channel_bound(peer: PeerCertificate<'_>, quote: &Quote) -> Outcome {
 
 /// Verify an endpoint against what was licensed.
 ///
-/// Returns a [`Verdict`] rather than a `Result`: **a failed check is an outcome, not an error.** A
-/// caller needs to know *which* check failed in order to tell a misconfiguration from an attack,
-/// and collapsing that into one error type throws the distinction away.
+/// # Prefer `connect_verified` when you are about to use the connection
 ///
-/// Call [`Verdict::is_trustworthy`] for the boolean.
+/// This function binds a quote to a certificate **it was handed**. It performs no I/O, so it cannot
+/// establish that the certificate came from the handshake being judged — a caller who supplies one
+/// obtained anywhere else gets a truthful verdict about a connection they are not using. And it
+/// returns a [`Verdict`] that can be ignored.
+///
+/// `verity_verifier::connect::connect_verified` (feature `connect`) dials the endpoint itself and
+/// yields a client only on a trustworthy verdict, so neither obligation reaches the caller. **That
+/// is the one to reach for from an agent.**
+///
+/// This one remains right for auditors reasoning about recorded evidence, for pre-purchase
+/// inspection where there is no connection yet, and for any embedder without a TCP stack — offline,
+/// `wasm32`, or inside another enclave. Which is why it, and not the wrapper, is the default build.
+///
+/// # Why a verdict and not a `Result`
+///
+/// **A failed check is an outcome, not an error.** A caller needs to know *which* check failed in
+/// order to tell a misconfiguration from an attack, and collapsing that into one error type throws
+/// the distinction away.
+///
+/// Call [`Verdict::is_trustworthy`] for the boolean, or [`crate::verdict::TrustworthyVerdict`] for
+/// a value that cannot be held unless every essential check passed.
 #[must_use]
 pub fn verify(
     licensed: &LicensedVersion,

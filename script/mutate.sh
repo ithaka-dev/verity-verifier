@@ -118,6 +118,10 @@ QUOTE=crates/verity-verifier/src/quote.rs
 IMAGES=crates/verity-verifier/src/images.rs
 VERDICT=crates/verity-verifier/src/verdict.rs
 CHANNEL=crates/verity-verifier/src/channel.rs
+ENDPOINT=crates/verity-verifier/src/endpoint.rs
+RATLS=crates/verity-verifier/src/ratls.rs
+TLS=crates/verity-verifier/src/connect/tls.rs
+CONNECT_HTTP=crates/verity-verifier/src/connect/http.rs
 
 echo "— the binding (C6: licensed_composeHash == attested_composeHash) —"
 
@@ -265,9 +269,143 @@ mutate "$VERDICT" \
   && run "a skipped check rendered as passed in the runner transcript"
 
 echo
+echo "— the verified transport (MA-1) —"
+#
+# CR-1 closed the mechanism; MA-1 closes the provenance. `verify()` binds a quote to a certificate it
+# was *handed*, and could not know it came from the handshake being judged. `connect_verified` owns
+# the socket — so the mutants below are about the two new ways that ownership can be given away:
+# accepting a peer that cannot prove it holds the key, and handing out a client anyway.
+
+# **The one that matters.** rustls offers no static-RSA suite, so in both TLS 1.2 and 1.3 the
+# certificate's private key signs the handshake and nothing else — these two calls are the only place
+# the peer proves it holds it. An enclave's RA-TLS certificate is PUBLIC: anyone who connects to the
+# real CVM can copy it. Stub these (which is exactly what ureq's own `DisabledVerifier` does) and a
+# relay serving that copy passes channel binding, because the certificate really does match the
+# quote. MA-1 would be decoration with a green suite on top of it.
+mutate "$TLS" \
+  '        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )' \
+  '        let _ = (message, cert, dss);
+        Ok(HandshakeSignatureValid::assertion())' \
+  && run "TLS 1.3 handshake signatures asserted instead of verified"
+
+# The same edit on the version a local client and server do NOT negotiate by default. Without
+# `the_same_replay_over_tls12_also_fails_the_handshake` pinning a TLS 1.2 server, this mutant changes
+# nothing any test observes — which is how a whole protocol version goes unchecked.
+mutate "$TLS" \
+  '        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )' \
+  '        let _ = (message, cert, dss);
+        Ok(HandshakeSignatureValid::assertion())' \
+  && run "TLS 1.2 handshake signatures asserted instead of verified"
+
+# The structural gate. `VerifiedClient` has no constructor that does not pass through here, so this
+# single edit is what would hand a client out on a verdict that failed an essential check — the
+# "verdict you can ignore" the 2026-08-09 review found, moved inside the library.
+mutate "$VERDICT" \
+  '        if verdict.is_trustworthy() {' '        if true {' \
+  && run "a client handed out on an untrustworthy verdict"
+
+# The post-verify guard in the connector. Removing it returns a transport for a connection that did
+# not verify — including on a *reconnect*, where nothing else would notice: the first request
+# succeeded, so an agent has every reason to believe the second one is talking to the same peer.
+mutate "$CONNECT_HTTP" \
+  '        let verdict =
+            TrustworthyVerdict::check(verdict).map_err(|verdict| Refusal::NotTrustworthy {
+                verdict: Box::new(verdict),
+            })?;' \
+  '        let verdict = TrustworthyVerdict::check(verdict)
+            .unwrap_or_else(|v| TrustworthyVerdict::check(v).unwrap_or_else(|_| unreachable!()));' \
+  && run "the post-verify guard removed from the connector"
+
+# The endpoint form dStack's own API advertises. Classifying the terminating host as passthrough
+# means `connect_verified` dials it and reports a bare channel-binding mismatch — the refusal that
+# reads as "the check is too strict" and invites the loosening ADR 0009 rule 3 forbids.
+mutate "$ENDPOINT" \
+  '            EndpointForm::DstackTerminating' '            EndpointForm::DstackPassthrough' \
+  && run "a TLS-terminating gateway host classified as passthrough"
+
+# The documented off-by-4. X.509's outer OCTET STRING is stripped by the parser; dStack's value is
+# *itself* one, so the quote starts 8 bytes after the OID and not 4. Dropping the nested unwrap
+# yields a buffer that still looks quote-shaped and fails later, somewhere less obvious.
+mutate "$RATLS" \
+  '    let inner = OctetString::from_der(extension.extn_value.as_bytes()).map_err(|e| {
+        AttestationError::UnreadableEnvelope {
+            reason: e.to_string(),
+        }
+    })?;
+    Ok(inner.into_bytes().into_vec())' \
+  '    Ok(extension.extn_value.as_bytes().to_vec())' \
+  && run "the nested OCTET STRING left on the quote (strip 4, not 8)"
+
+# A redirect to another host is a request to leave the connection that was verified. Following one
+# carries an agent request to a peer nobody attested, and returns its body under a
+# `VerifiedClient` — a verdict about one endpoint attached to an answer from another.
+mutate "$CONNECT_HTTP" \
+  '        .max_redirects(0)' '        .max_redirects(10)' \
+  && run "redirects followed away from the verified peer"
+
+# **The deadline, which was a defect before it was a test.** A per-socket read timeout bounds a peer
+# that says nothing; it does not bound one that says something every half-timeout, because
+# `complete_io` loops internally and never returns for a deadline to be checked around it. Give each
+# read the full budget instead of what remains and a dribbling peer stalls the verification forever
+# — measured at 31s against a 300ms budget. This is the mutant that stops that regression shipping
+# 28/28 green, which is precisely how the original got in.
+mutate "$TLS" \
+  '.checked_duration_since(Instant::now())' \
+  '.checked_duration_since(Instant::now() - Duration::from_secs(3600))' \
+  && run "the handshake deadline never counts down, so each read gets the whole budget"
+
+# Port 0 parses as a `u16` and names nothing to connect to. `Ok(0) | Err(_)` share a source line, so
+# per-line coverage cannot tell whether both patterns are exercised — the exact "coverage cannot tell
+# an assertion from a bystander" case this file exists for.
+mutate "$ENDPOINT" \
+  'Ok(0) | Err(_) => return Err(EndpointError::BadPort { port: p.to_owned() }),' \
+  'Err(_) => return Err(EndpointError::BadPort { port: p.to_owned() }),' \
+  && run "port 0 accepted as a connectable port"
+
+echo
 echo "— known equivalent —"
 note_equivalent "ComposeHash::of over a Vec vs a slice" \
   "sha2 hashes the same bytes either way; the signature difference is ergonomic, not observable."
+
+# Recorded rather than omitted. The guard is real and its absence would be a spinning thread that
+# `DeadlineIo` cannot bound — that path performs no I/O, so nothing consults the deadline. But the
+# state it guards is not reachable in rustls 0.23.42, so removing it changes no observable
+# behaviour, which is this file's definition of equivalent.
+note_equivalent "connect/tls.rs: the Ok((0, 0)) hot-spin guard" \
+  "complete_io returns (0,0) only when !wants_write() && !wants_read(); mid-handshake wants_read()
+             goes false only via has_received_close_notify, which common_state.rs:524 sets only when
+             may_receive_application_data is true — false during a handshake, with rustls' own
+             comment 'do not treat unauthenticated alerts like this'. Probed: a peer answering the
+             ClientHello with a plaintext close_notify is bounded by the deadline, not by this guard.
+             Kept against a future rustls making the state reachable; re-check on a rustls bump."
+
+echo
+echo "— NOT mutable, and said out loud —"
+#
+# Two lines in the verified transport carry real security weight and cannot be scored here. Listing
+# them is the point: a harness that silently omits what it cannot test looks complete while a
+# behaviour goes unchecked, which is the failure this file exists to prevent. Both are review
+# checklist items instead.
+echo "  review    connect/tls.rs: \`config.resumption = Resumption::disabled()\`"
+echo "            A resumed handshake calls NEITHER signature verifier — rustls hard-codes both"
+echo "            assertions on that path — so the quote would come from a remembered certificate"
+echo "            rather than this connection's. Deleting the line leaves every test green, because"
+echo "            a resumed connection in the cases we can build locally still presents the right"
+echo "            certificate. Nothing here can defend it; a human must."
+echo "  review    connect/http.rs: \`Transport::is_tls() -> true\`"
+echo "            Defaults to false, and ureq then rejects an https request over a fully verified"
+echo "            connection. Behaviourally defended by the request tests rather than by a mutant:"
+echo "            remove it and every request fails, which is loud but is not a scored kill."
 
 echo
 total=$((killed + survived))

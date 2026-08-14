@@ -21,6 +21,14 @@ attest = ["dep:dcap-qvl"]
 # Retrieval helpers. Off by default: verification itself takes bytes and does no I/O, so an
 # embedder that already has the compose document pays nothing for an HTTP client.
 fetch = ["dep:ureq"]
+# The verified transport: `connect_verified` dials the endpoint, performs the RA-TLS handshake, and
+# verifies *that handshake's* certificate. Off by default for the same reason `fetch` is, and one
+# more: the crate must stay embeddable where there is no TCP stack — offline audit, another enclave,
+# wasm32. `default = ["attest"]` is what keeps that true.
+#
+# Implies `attest` because `crate::verify` is itself behind `attest`; a `connect` that could not
+# call `verify` would be a transport with nothing to verify with.
+connect = ["attest", "dep:ureq", "dep:rustls", "dep:rustls-pki-types"]
 
 [dependencies]
 thiserror = { workspace = true }
@@ -29,6 +37,8 @@ serde_json = { workspace = true }
 yaml-rust2 = { workspace = true }
 dcap-qvl = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 # Not optional and not behind `attest`: `ChannelBound` is an essential check, and channel binding
 # needs only SHA-512 and an X.509 parse — no Intel collateral, no `ring`. Gating it would leave the
 # wasm bindings unable to perform the one check CR-1 is about. Reasoning in full at the workspace
@@ -38,6 +48,14 @@ x509-cert = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+# Integration tests are separate crates, so they need their own declaration even though the library
+# depends on this already. Used to build the RA-TLS commitment a locally keyed test certificate has
+# to satisfy — `sha512("ratls-cert:" || SPKI)`.
+sha2 = { workspace = true }
+# Same reason: `tests/verified_transport.rs` stands up a local rustls server, which means naming the
+# server side of the TLS stack the library only uses as a client.
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 # The example's `--leaf-cert` accepts PEM; the library takes DER only. Dev-only, so no embedder pays
 # for a container format they do not use. Also used by the fixture tests, which store certificates
 # as PEM because that is the form an operator captures them in.
@@ -48,7 +66,15 @@ pem-rfc7468 = { workspace = true }
 # every embedder.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 dcap-qvl = { workspace = true }
+# Local certificates for the `connect` tests. A verified transport cannot be tested without a
+# server to dial, and a server needs a key. Dev-only, so no embedder pays for a certificate
+# *generator* in a crate whose job is to refuse certificates.
+rcgen = { workspace = true }
 
 [[example]]
 name = "verify-attestation"
 required-features = ["attest"]
+
+[[example]]
+name = "connect-verified"
+required-features = ["connect"]

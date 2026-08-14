@@ -48,6 +48,7 @@ use std::process::ExitCode;
 use verity_verifier::attest::{Collateral, TcbPolicy};
 use verity_verifier::binding::ComposeHash;
 use verity_verifier::channel::PeerCertificate;
+use verity_verifier::endpoint::{Endpoint, EndpointForm};
 use verity_verifier::quote::Measurement;
 use verity_verifier::reference::BootReference;
 use verity_verifier::verdict::transcript_line;
@@ -349,56 +350,43 @@ fn load_leaf_certificate(path: &str) -> Result<Vec<u8>, String> {
 
 /// Warn when an endpoint uses dStack's TLS-*terminating* gateway form.
 ///
-/// The gateway routes on an SNI suffix: `<app_id>-<port>s.<domain>` passes encrypted bytes through
-/// to the enclave, while `<app_id>-<port>.<domain>` — the form the platform advertises — has the
-/// gateway terminate TLS and present a valid Let's Encrypt certificate for *itself*. Ordinary TLS
-/// verification succeeds against it, so nothing looks wrong; the peer is simply not the enclave and
-/// channel binding cannot succeed.
+/// The rule itself now lives in [`verity_verifier::endpoint`], where tests can reach it — while it
+/// lived here nothing could, which is the same defect `transcript_line` was moved out of this file
+/// to fix. What stays here is the *policy*: one classifier, two call sites, and they behave
+/// differently on purpose.
 ///
-/// **Advisory only.** It touches neither the verdict nor the exit code — the refusal is already
-/// produced by consequence, when the gateway's certificate fails to match the quote. This exists
-/// because that refusal is otherwise indistinguishable from an attack, and working that out cost
-/// four CVM runs.
+/// **Advisory only, and that includes an unparseable endpoint.** It touches neither the verdict nor
+/// the exit code. This runner's `verify()` path takes a caller-supplied certificate and must not
+/// refuse — the refusal is already produced by consequence, when the gateway's certificate fails to
+/// match the quote — whereas `connect_verified` owns the connection and refuses outright.
 ///
-/// Warns only on a *positive* match of the dangerous shape. Unrecognised hosts say nothing, or
-/// `06`'s `relay.attacker.example` would generate noise on every run.
+/// **The exit code is load-bearing here.** `04` and `06` distinguish exit 1 (*refused*) from exit 2
+/// (*could not run*), so a typo in a diagnostic argument must not turn a refusal into an
+/// inconclusive result. Hence a warning and a return, never `ExitCode::from(2)`.
 ///
-/// The app-id length is pinned at **40 hex characters** rather than "some hex", because dStack's
-/// app-id is 20 bytes — `38817d24b2e3bd9cdeae1acc60aaec7ea0957d18`, recorded in
-/// `tests/fixtures/PROVENANCE.md`. Accepting any length made `ab-80.example.com` warn, and a
-/// diagnostic that cries wolf gets ignored on the day it is right. Observed firing on the real
-/// terminated host and staying silent on the real passthrough host from the same capture.
+/// Warns only on a positive match. Unrecognised hosts say nothing, or `06`'s
+/// `relay.attacker.example` would generate noise on every run.
 fn warn_if_tls_terminating(endpoint: &str) {
-    /// dStack app-id: 20 bytes, rendered as hex.
-    const APP_ID_HEX_LEN: usize = 40;
-
-    // Deliberately not a URL parser: this is a hint, and a dependency for a hint is a bad trade.
-    let host = endpoint
-        .split_once("://")
-        .map_or(endpoint, |(_, rest)| rest)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("");
-    let Some((first_label, _)) = host.split_once('.') else {
-        return;
+    let parsed = match Endpoint::parse(endpoint) {
+        Ok(parsed) => parsed,
+        Err(why) => {
+            // Said, not swallowed — and still not fatal. See the doc comment.
+            eprintln!("warning: --endpoint could not be classified ({why}); it is advisory here");
+            return;
+        }
     };
-    // `<40 hex chars>-<port>` terminates; `<40 hex chars>-<port>s` passes through. Splitting on the
-    // last `-` means the `s` suffix lands in `port`, where `is_ascii_digit` rejects it — which is
-    // exactly right: the passthrough form must not warn.
-    let Some((app_id, port)) = first_label.rsplit_once('-') else {
+    if parsed.form() != EndpointForm::DstackTerminating {
         return;
-    };
-    let is_terminating_gateway = app_id.len() == APP_ID_HEX_LEN
-        && app_id.chars().all(|c| c.is_ascii_hexdigit())
-        && !port.is_empty()
-        && port.chars().all(|c| c.is_ascii_digit());
-    if is_terminating_gateway {
-        eprintln!(
-            "warning: `{host}` is dStack's TLS-TERMINATING gateway form. The certificate you get \
-             from it belongs to the gateway, not the enclave, so channel binding cannot succeed. \
-             The passthrough form appends `s` to the port label: `{app_id}-{port}s.…`"
-        );
     }
+    let passthrough = parsed
+        .passthrough_form()
+        .unwrap_or_else(|| parsed.host().to_owned());
+    eprintln!(
+        "warning: `{}` is dStack's TLS-TERMINATING gateway form. The certificate you get from it \
+         belongs to the gateway, not the enclave, so channel binding cannot succeed. The \
+         passthrough form appends `s` to the port label: `{passthrough}`",
+        parsed.host()
+    );
 }
 
 /// Load a caller-supplied boot reference.

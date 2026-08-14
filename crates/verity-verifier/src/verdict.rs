@@ -325,6 +325,94 @@ impl Default for Verdict {
     }
 }
 
+/// A verdict in which every essential check ran and passed.
+///
+/// # Why this type exists
+///
+/// [`Verdict::is_trustworthy`] is a method a caller has to remember to call, and then remember to
+/// act on. The 2026-08-09 review's finding was that the crate's `VerifiedCompose` /
+/// `ChannelBinding` discipline — *one constructor, and it performs the check* — stopped at the
+/// verdict, so invariant I1 rested on every agent author writing
+/// `if !verdict.is_trustworthy() { return }`. **A verdict that can be ignored is a verdict that
+/// will be.**
+///
+/// So this applies the same discipline one layer out. The only constructor is
+/// [`TrustworthyVerdict::check`]; holding one is evidence the verdict was judged, and
+/// [`crate::connect::VerifiedClient`] cannot be built without one.
+///
+/// # Ungated on purpose
+///
+/// It sits here rather than in `connect` so that callers of raw [`crate::verify::verify`] get the
+/// same affordance without a TCP stack, and so the WASM bindings can adopt it later without a
+/// feature. It adds no dependency.
+///
+/// # What it does not establish
+///
+/// That the evidence came from the connection you are using. Every essential check passing is a
+/// statement about the inputs it was given; [`crate::connect::connect_verified`] is what makes
+/// those inputs come from a handshake it performed itself.
+#[derive(Debug, Clone)]
+pub struct TrustworthyVerdict(Verdict);
+
+impl TrustworthyVerdict {
+    /// Judge a verdict, and return it wrapped only if every essential check ran and passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the verdict **back, unchanged**, when any essential check did not pass. Returned
+    /// rather than discarded because a refusal a caller cannot explain is a refusal they will
+    /// eventually route around: [`Verdict::failures`] and [`Verdict::unrun_essentials`] are how
+    /// they tell a misconfiguration from an attack, and `Display` renders the whole transcript.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use verity_verifier::verdict::{Check, Outcome, TrustworthyVerdict, Verdict};
+    ///
+    /// let empty = Verdict::new();
+    /// // Nothing ran, so nothing passed — and the verdict comes back for rendering.
+    /// let returned = TrustworthyVerdict::check(empty).expect_err("no check ran");
+    /// assert_eq!(returned.unrun_essentials(), Check::essential());
+    /// # let _ = Outcome::Passed;
+    /// ```
+    pub fn check(verdict: Verdict) -> Result<Self, Verdict> {
+        // `is_trustworthy` rather than a re-implementation, so there is exactly one definition of
+        // "every essential check ran and passed" in the crate. A second one here would be a place
+        // for the two to drift, and the drift would be invisible: both would keep returning a
+        // boolean that looks right.
+        if verdict.is_trustworthy() {
+            Ok(Self(verdict))
+        } else {
+            Err(verdict)
+        }
+    }
+
+    /// The verdict, which by construction is trustworthy.
+    ///
+    /// Still the full transcript rather than a boolean: ADR 0014 requires a verdict to carry which
+    /// checks ran, and that obligation does not lapse because the answer was yes.
+    #[must_use]
+    pub const fn verdict(&self) -> &Verdict {
+        &self.0
+    }
+
+    /// Unwrap to the underlying verdict.
+    ///
+    /// The one-way door: a `Verdict` can be turned into a `TrustworthyVerdict` only through
+    /// [`TrustworthyVerdict::check`], while going the other way is free. That asymmetry is the
+    /// point — it is what makes holding the wrapper mean something.
+    #[must_use]
+    pub fn into_verdict(self) -> Verdict {
+        self.0
+    }
+}
+
+impl fmt::Display for TrustworthyVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
 impl fmt::Display for Verdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(

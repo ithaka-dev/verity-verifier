@@ -125,9 +125,39 @@ jobs:
       # standard library must be added against the pinned toolchain rather than the action's.
       - run: rustup target add wasm32-unknown-unknown
       # The crate claims wasm32 support. A claim nothing builds is aspiration, so it is built here.
+      #
+      # **Never add `--all-features` to this line.** The `connect` feature opens a TCP socket, so it
+      # carries a `compile_error!` for wasm32 — a deliberate, narrow exception to Cargo's additivity
+      # rule over a combination that could not link anyway (`ring` has no backend for that target).
+      # The job builds the wasm crate specifically, which depends on the core with
+      # `default-features = false` and enables nothing, so nothing leaks under resolver v2.
       - run: cargo build -p verity-verifier-wasm --target wasm32-unknown-unknown
       # The core must also build without `attest`, since that is what makes the target reachable.
       - run: cargo build -p verity-verifier --no-default-features
+
+  connect-alone:
+    name: the verified transport, on a trimmed graph
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `connect` without `fetch`, which is the configuration an embedder who wants a verified
+      # transport and no IPFS retrieval actually gets — and which nothing else here compiles.
+      #
+      # What it catches: `connect` acquiring a dependency on `fetch`. The two both use `ureq`, and
+      # `fetch` additionally turns on `ureq/rustls` → `rustls/ring`. So a `connect` that leaned on a
+      # feature `fetch` happens to enable would build under `--all-features` and CI would be silent.
+      #
+      # **What it does not yet prove, stated so nobody reads more into it:** this is still not a
+      # single-provider graph. `connect` implies `attest` implies `dcap-qvl` with its default
+      # `report` feature, which pulls reqwest and therefore `rustls/aws_lc_rs` — so both providers
+      # are compiled here too, exactly as under `--all-features`. That is the recorded `dcap-qvl`
+      # finding, and when it is fixed this leg becomes the ring-only build as well. Until then,
+      # `connect/tls.rs` never calls the bare `ClientConfig::builder()` for the reason its own unit
+      # test pins: with both providers on, it panics.
+      - run: cargo build -p verity-verifier --no-default-features --features connect
+      - run: cargo test -p verity-verifier --no-default-features --features connect --lib
 
   no-dangerous-attestation:
     name: TCB enforcement is not overridable

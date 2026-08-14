@@ -88,6 +88,55 @@ Check 7 is not essential because it compares against a reference most callers do
 absence is a legitimate configuration rather than a gap. `RTMR3` is never compared at all — see the
 three rules above.
 
+## Using it: `connect_verified` is the one to reach for
+
+```text
+use verity_verifier::connect::{connect_verified, ConnectOptions, ConnectRequest};
+use verity_verifier::endpoint::Endpoint;
+
+let endpoint = Endpoint::parse("https://<app-id>-8443s.<domain>")?;
+let request = ConnectRequest::new(&endpoint, &licensed, compose_document, &tcb_policy);
+
+// Dials, handshakes, lifts the quote out of *that handshake's* certificate, verifies, and
+// returns a client only if every essential check passed. There is no way to obtain one otherwise.
+let client = connect_verified(&request, &my_collateral_source, &ConnectOptions::default())?;
+let response = client.get("/health")?;
+```
+
+Behind the non-default `connect` feature, because the crate must stay buildable where there is no
+TCP stack — offline audit, another enclave, `wasm32`.
+
+**Why this rather than `verify()`.** `verify()` binds a quote to a certificate it was *handed*. It
+performs no I/O, so it cannot establish that the certificate came from the handshake being judged —
+a caller who supplies one obtained anywhere else gets a truthful verdict about a connection they are
+not using. And its result is a `Verdict` you can ignore, so the guarantee rested on every agent
+author remembering `if !verdict.is_trustworthy() { return }`. **A verdict that can be ignored is a
+verdict that will be.**
+
+`connect_verified` owns the socket, the handshake, the certificate and the quote; you supply none of
+them. A `VerifiedClient` has no public constructor and no path from an untrustworthy verdict, so the
+check cannot be skipped by forgetting it. Every reconnect the client makes is verified the same way.
+
+**`verify()` is not deprecated by this.** It remains right for auditors reasoning about recorded
+evidence, for pre-purchase inspection where there is no connection yet, and for any embedder without
+a TCP stack. That path is the default; this is additive to it.
+
+**What a caller still supplies is Intel collateral**, through `CollateralSource`, and it is handed
+the quote *this handshake produced* — collateral is FMSPC-specific, so it cannot be fetched earlier,
+and `dcap-qvl` fetches it asynchronously, so doing it inside would mean this crate choosing an async
+runtime for every embedder. That seam is safe for a reason worth generalising: `dcap-qvl` compiles
+Intel's production root into the binary and checks collateral against *that*, so a wrong or hostile
+answer causes a refusal, never an acceptance. **If getting a seam wrong could produce a false
+accept, it does not belong in caller code** — which is why there is no way to inject a transport.
+
+### JavaScript callers
+
+`connect_verified` is **not** available from the WASM bindings, and that is deliberate rather than
+unfinished: a browser cannot open a raw TLS connection, and `fetch()` does not expose the peer
+certificate at all, so a "verified transport" there would verify nothing. In Node, obtain the DER
+from your own TLS layer — `socket.getPeerX509Certificate().raw` — and pass it to `verify`. A
+Node-native binding that can genuinely own the handshake is a separate piece of work.
+
 ## What a verdict tells you
 
 Never a bare boolean. Every verdict carries the verifier version, the reference-data date, and
