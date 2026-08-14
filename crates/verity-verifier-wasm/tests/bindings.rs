@@ -22,12 +22,35 @@ const LICENSED_HASH: &str = "64690ef38b54187da11a41a54905f5f539e948a0414ceb312c8
 const LICENSED_IMAGE: &str =
     "sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc";
 
+// — the channel-binding pair, captured together from CVM 9be9f370 on dstack-0.5.9 —
+//
+// See `crates/verity-verifier/tests/fixtures/PROVENANCE.md`. The quote lives *inside* the
+// certificate, so these two are one artifact read two ways rather than two that happen to agree.
+const RATLS_LEAF_PEM: &[u8] =
+    include_bytes!("../../verity-verifier/tests/fixtures/ratls-leaf-dstack-0.5.9.pem");
+const RATLS_QUOTE_HEX: &str =
+    include_str!("../../verity-verifier/tests/fixtures/ratls-leaf-dstack-0.5.9.quote.hex");
+const GATEWAY_LEAF_PEM: &[u8] =
+    include_bytes!("../../verity-verifier/tests/fixtures/gateway-leaf-letsencrypt.pem");
+
 /// The quote the hardware actually signed.
 fn quote() -> Vec<u8> {
-    let hex = QUOTE_HEX.trim();
+    hex_bytes(QUOTE_HEX)
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    let hex = hex.trim();
     (0..hex.len() / 2)
         .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("fixture is hex"))
         .collect()
+}
+
+/// Fixtures are stored as PEM because that is the form an operator captures a certificate in; the
+/// bindings take DER, exactly as a JavaScript caller would after decoding a handshake certificate.
+fn der(pem: &[u8]) -> Box<[u8]> {
+    let (label, der) = pem_rfc7468::decode_vec(pem).expect("fixture is PEM");
+    assert_eq!(label, "CERTIFICATE");
+    der.into_boxed_slice()
 }
 
 /// ADR 0012: every distribution surface reports the same version.
@@ -186,4 +209,64 @@ fn a_hash_of_the_wrong_length_is_refused() {
             "{candidate:?} is not a 32-byte hash"
         );
     }
+}
+
+// — CR-1: channel binding through the bindings —
+
+/// The *not-laxer-than-the-core* property, extended to the check CR-1 is about.
+///
+/// A JavaScript agent that could be talked out of channel binding — by omission, by a laxer
+/// comparison, by an error mapped to `null` — is a weakened verifier obtained without touching the
+/// Rust crate at all, and the agents most likely to embed this surface are the JavaScript ones.
+///
+/// All three directions are asserted against the core, not merely against expectations: the
+/// bindings must agree with `ChannelBinding::check` on the genuine pair, on a genuine certificate
+/// from a different enclave, and on the gateway's publicly trusted certificate.
+#[test]
+fn the_bindings_perform_channel_binding_exactly_as_the_core_does() {
+    use verity_verifier::channel::ChannelBinding;
+    use verity_verifier::quote::Quote;
+
+    let ratls_quote = hex_bytes(RATLS_QUOTE_HEX);
+    let ratls_leaf = der(RATLS_LEAF_PEM);
+    let gateway_leaf = der(GATEWAY_LEAF_PEM);
+    let parsed = Quote::parse(&ratls_quote).expect("the 0.5.9 fixture parses");
+
+    // `null` means "no problem", so the pair the hardware produced must read as null — otherwise a
+    // caller doing the right thing sees a refusal and starts loosening things.
+    assert!(
+        bindings::check_channel_binding(&ratls_quote, &ratls_leaf).is_none(),
+        "the certificate and the quote it carries must bind"
+    );
+    assert!(ChannelBinding::check(&ratls_leaf, &parsed).is_ok());
+
+    // A genuine quote from a *different*, destroyed CVM: CR-1's replay, through the bindings.
+    let relayed = bindings::check_channel_binding(&quote(), &ratls_leaf)
+        .expect("a quote from another enclave must not bind");
+    assert!(relayed.contains("channel binding failed"), "{relayed}");
+
+    // The dangerous negative: ordinary TLS verification *succeeds* against this certificate.
+    let terminated = bindings::check_channel_binding(&ratls_quote, &gateway_leaf)
+        .expect("the gateway's certificate must not bind");
+    assert!(
+        terminated.contains("channel binding failed"),
+        "{terminated}"
+    );
+    assert!(ChannelBinding::check(&gateway_leaf, &parsed).is_err());
+}
+
+/// A quote that cannot be parsed is a refusal, not an absence — the same reading `quoteMrConfigId`
+/// documents. Anything else would let malformed input read as "no problem here".
+#[test]
+fn channel_binding_refuses_rather_than_returning_no_problem_on_bad_input() {
+    let ratls_leaf = der(RATLS_LEAF_PEM);
+    assert!(bindings::check_channel_binding(b"not a quote", &ratls_leaf).is_some());
+    assert!(bindings::check_channel_binding(&[], &ratls_leaf).is_some());
+
+    let not_a_certificate = bindings::check_channel_binding(&hex_bytes(RATLS_QUOTE_HEX), b"nope")
+        .expect("bytes that are not a certificate must refuse");
+    assert!(
+        not_a_certificate.contains("could not be parsed"),
+        "a caller cannot act on a refusal that does not say which: {not_a_certificate}"
+    );
 }

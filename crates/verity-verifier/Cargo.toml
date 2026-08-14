@@ -29,10 +29,19 @@ serde_json = { workspace = true }
 yaml-rust2 = { workspace = true }
 dcap-qvl = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
+# Not optional and not behind `attest`: `ChannelBound` is an essential check, and channel binding
+# needs only SHA-512 and an X.509 parse — no Intel collateral, no `ring`. Gating it would leave the
+# wasm bindings unable to perform the one check CR-1 is about. Reasoning in full at the workspace
+# manifest.
+x509-cert = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+# The example's `--leaf-cert` accepts PEM; the library takes DER only. Dev-only, so no embedder pays
+# for a container format they do not use. Also used by the fixture tests, which store certificates
+# as PEM because that is the form an operator captures them in.
+pem-rfc7468 = { workspace = true }
 # For `examples/verify-attestation.rs` only. The library performs no I/O and chooses no async
 # runtime — that is deliberate, so verification can run offline, in wasm32, or inside another
 # enclave. The example fetches collateral, so it needs both; a dev-dependency keeps that cost off

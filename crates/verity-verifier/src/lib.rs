@@ -8,27 +8,35 @@
 //! This crate is scaffolding. **No result it produces means anything yet.** Do not wire it into
 //! anything that makes a trust decision until this notice is removed and a version is tagged.
 //!
-//! ## Specifically: there is no channel binding, and its absence is not visible in a verdict
+//! ## Channel binding: what it now establishes, and what it still trusts you for
 //!
-//! Every check this crate performs treats the TDX quote as a **detached artifact**. Nothing ties
-//! the quote to the connection an agent actually opens, so a genuine quote recorded from one CVM —
-//! including one that has since been destroyed — paired with an endpoint an attacker controls
-//! passes every essential check and yields `is_trustworthy() == true`.
+//! Until CR-1 of the 2026-08-09 system-design review, every check here treated the TDX quote as a
+//! **detached artifact**: a genuine quote recorded from one CVM — including one since destroyed —
+//! paired with an endpoint an attacker controls passed every essential check and returned
+//! `is_trustworthy() == true`. That is closed. [`channel::ChannelBinding::check`] compares the
+//! quote's `report_data` against the certificate presented on the connection, and
+//! [`verdict::Check::ChannelBound`] is in [`verdict::Check::essential`], so a verdict that did not
+//! establish it cannot be trustworthy.
 //!
-//! This needs no man-in-the-middle and no network position: a hostile or buggy orchestrator
-//! returning a real `cvm_id`'s quote beside its own endpoint is sufficient. The agent then sends
-//! the holder's data to the attacker while `licensed_composeHash == attested_composeHash` holds
-//! throughout, and while every invariant the design states reads as satisfied.
+//! **The residual, stated plainly: this crate performs no I/O, so it cannot know that the
+//! certificate you handed it is the one your TLS handshake returned.** It verifies that the quote
+//! commits to *that certificate*; it takes your word that the certificate came from the endpoint
+//! being judged. A caller who supplies a certificate obtained from somewhere else gets a truthful
+//! verdict about a connection they are not using. Closing that gap needs a component that dials the
+//! endpoint itself — MA-1's `connect_verified` — and it is not in this crate yet.
 //!
-//! The primitive that closes this exists — dStack's RA-TLS commits the TLS key into the quote's
-//! `report_data`, which [`quote::Quote::report_data`] now parses — but **the comparison is not
-//! implemented**, `Evidence` cannot yet carry a certificate, and `ChannelBound` is not in
-//! [`verdict::Check::essential`]. Until all three land, treat a trustworthy verdict from this crate
-//! as establishing *what is running somewhere*, never *what you are talking to*.
+//! Two more things a reader should not have to discover the hard way:
 //!
-//! Tracked as CR-1 of the 2026-08-09 system-design review. The refusal this crate cannot yet
-//! produce is demonstrated by `verity-foundation/closed-loop/06-refuses-relayed-endpoint.sh`,
-//! which is expected to fail until the check exists.
+//! - **dStack's default endpoint form cannot be channel bound.** The gateway terminates TLS on
+//!   `<app_id>-<port>.<domain>` and hands the client a valid Let's Encrypt certificate for the
+//!   *gateway*, so ordinary TLS verification succeeds while the peer is not the enclave. Only the
+//!   `s`-suffixed passthrough form reaches the enclave's own certificate. This crate refuses the
+//!   terminating form rather than falling back, because the certificate simply does not match.
+//! - **The leaf is not chain validated.** Intel's signature over the quote is what establishes
+//!   authenticity; the Dstack App CA's opinion about the key would be a second, weaker one.
+//!
+//! The refusal is demonstrated end-to-end by
+//! `verity-foundation/closed-loop/06-refuses-relayed-endpoint.sh`.
 //!
 //! # The three rules
 //!
@@ -49,11 +57,13 @@
 //! # Using it
 //!
 //! ```no_run
+//! use verity_verifier::channel::PeerCertificate;
 //! use verity_verifier::verify::{verify, Evidence, LicensedVersion};
 //! use verity_verifier::{attest::TcbPolicy, binding::ComposeHash};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # let (raw_quote, compose_document, collateral) = (vec![], vec![], unimplemented!());
+//! # let leaf_cert_der: Vec<u8> = vec![];
 //! let licensed = LicensedVersion {
 //!     compose_hash: ComposeHash::parse_hex("64690ef3…")?,
 //!     image_digest: "sha256:d9e853e8…".to_owned(),
@@ -61,7 +71,16 @@
 //!
 //! let verdict = verify(
 //!     &licensed,
-//!     &Evidence { raw_quote: &raw_quote, compose_document, collateral: &collateral, now_secs: 0 },
+//!     &Evidence {
+//!         raw_quote: &raw_quote,
+//!         compose_document,
+//!         collateral: &collateral,
+//!         now_secs: 0,
+//!         // The leaf from *this endpoint's* handshake. `PeerCertificate::NotConnected` is the
+//!         // honest alternative for offline audit — and makes the verdict untrustworthy, because
+//!         // a quote in a file says what ran somewhere, not what you are talking to.
+//!         peer_certificate: PeerCertificate::Presented(&leaf_cert_der),
+//!     },
 //!     None,
 //!     &TcbPolicy::default(),
 //! );
@@ -83,6 +102,10 @@
 #[cfg(feature = "attest")]
 pub mod attest;
 pub mod binding;
+// Ungated, unlike `verify`. Channel binding needs only SHA-512 and an X.509 parse — no Intel
+// collateral and no `ring` — so putting it behind `attest` would leave the WASM bindings unable to
+// perform the one check CR-1 is about.
+pub mod channel;
 pub mod compose;
 pub mod images;
 pub mod quote;

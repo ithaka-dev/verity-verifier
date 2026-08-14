@@ -201,6 +201,34 @@ fn tcb_status_is_an_essential_check() {
     );
 }
 
+// — channel binding is essential (CR-1) —
+
+/// **The one line that closes CR-1.**
+///
+/// Every other check in this list can be satisfied by a genuine quote recorded from a CVM that no
+/// longer exists, presented beside an endpoint an attacker controls. `ChannelBound` cannot: it
+/// compares the quote's `report_data` against the certificate of the connection actually in use, and
+/// a relay that could satisfy it would be holding the enclave's private key.
+///
+/// Membership is the whole mechanism. The comparison existing but sitting outside `essential()`
+/// would be the exact defect ADR 0014 was written about, and the one `TcbStatus` had until T-11:
+/// honest in the transcript, absent from the boolean an agent branches on.
+#[test]
+fn channel_binding_is_an_essential_check() {
+    assert!(
+        Check::essential().contains(&Check::ChannelBound),
+        "CR-1: a verdict that did not bind the quote to the connection means nothing"
+    );
+    assert!(
+        !essentials_with(Check::ChannelBound, &skipped("no connection was made")).is_trustworthy(),
+        "an offline audit is not a verified endpoint"
+    );
+    assert!(
+        !essentials_with(Check::ChannelBound, &failed("relayed")).is_trustworthy(),
+        "a genuine quote over somebody else's connection is not a verified endpoint"
+    );
+}
+
 /// When the signature does not verify, TCB is recorded as skipped — there is nothing to judge. The
 /// verdict must be untrustworthy on both counts rather than on one.
 #[test]
@@ -373,6 +401,13 @@ fn check_names_are_stable_identifiers() {
         (Check::TcbStatus, "tcb_status"),
         (Check::MrConfigId, "mr_config_id"),
         (Check::BootMeasurements, "boot_measurements"),
+        // Now a **shell** contract as well as a telemetry one:
+        // `closed-loop/04-refuses-on-mismatch.sh` greps `^  channel_bound +skipped` and
+        // `06-refuses-relayed-endpoint.sh` greps `^  channel_bound +FAILED`. A rename here goes
+        // green in `cargo test` and turns a gate that needs a live CVM red — which is why the name
+        // is pinned rather than assumed. The rendering around it is pinned by
+        // `tests/transcript_contract.rs`.
+        (Check::ChannelBound, "channel_bound"),
     ];
     for (check, name) in expected {
         assert_eq!(check.name(), name);

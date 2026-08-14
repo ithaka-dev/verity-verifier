@@ -104,17 +104,29 @@ impl Measurement {
 /// RA-TLS puts a commitment to the TLS key here, so that a quote proves something about a *live
 /// connection* rather than merely about a machine.
 ///
-/// **Parsing this is not checking it.** Reading the field establishes nothing on its own — the
-/// comparison against the connection's certificate is what makes the quote non-detachable, and
-/// until that check exists a populated `report_data` is decoration. See [`crate`].
+/// **Parsing this is not checking it.** Reading the field establishes nothing on its own; the
+/// comparison against the connection's certificate is what makes the quote non-detachable. That
+/// comparison is [`crate::channel::ChannelBinding::check`], and it is the only place in this crate
+/// where a `report_data` is compared against anything.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReportData([u8; REPORT_DATA_LEN]);
 
 impl ReportData {
-    /// From raw bytes.
+    /// From raw bytes, for known-answer tests against a recorded quote.
     ///
-    /// Public so an *expected* commitment can be constructed for comparison. Constructing one does
-    /// not assert it came from a quote — only [`Quote::parse`] does that.
+    /// Constructing one does not assert it came from a quote — only [`Quote::parse`] does that.
+    ///
+    /// # This is not the channel-binding check
+    ///
+    /// An earlier version of this comment said the constructor was "public so an *expected*
+    /// commitment can be constructed for comparison". That sentence recommended a bug and is
+    /// withdrawn. Building a `ReportData` by hand and writing `quote.report_data() == &expected`
+    /// **skips the all-zero refusal**: a quote from an enclave that committed to nothing carries 64
+    /// zero bytes, and it compares equal to any expectation that is also empty. The comparison
+    /// succeeds and establishes nothing.
+    ///
+    /// Use [`crate::channel::ChannelBinding::check`], which performs the refusal first and cannot
+    /// be reached without it.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; REPORT_DATA_LEN]) -> Self {
         Self(bytes)
@@ -439,10 +451,10 @@ impl Quote {
 
     /// `report_data` — the workload-supplied field RA-TLS commits the TLS key into.
     ///
-    /// Exposed so a channel-binding check can compare it against the certificate presented on the
-    /// connection actually in use. **A quote read from a file says nothing about a connection**: it
-    /// is this comparison, and only this comparison, that stops a genuine quote from being replayed
-    /// beside an endpoint it never attested.
+    /// **A quote read from a file says nothing about a connection.** Comparing this against the
+    /// certificate presented on the connection actually in use is what stops a genuine quote from
+    /// being replayed beside an endpoint it never attested — and that comparison is
+    /// [`crate::channel::ChannelBinding::check`], never a naked `==` here.
     #[must_use]
     pub const fn report_data(&self) -> &ReportData {
         &self.report_data

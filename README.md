@@ -53,6 +53,41 @@ pressure and a reader who never opens the source should still meet them.
    everything continues to look like it works. The correct response is to narrow *what* is compared
    to values that are legitimately stable — never to weaken *how strictly*.
 
+## What is checked
+
+Seven essential checks plus one optional. A verdict that did not pass **every** essential is not
+trustworthy, whatever else it says.
+
+| # | Check | Essential | Establishes |
+|---|---|---|---|
+| 1 | `compose_hash` | yes | the served `app-compose.json` is the one the licence names |
+| 2 | `images_pinned` | yes | every image in it is digest-pinned, no tags (I8, ADR 0007) |
+| 3 | `licensed_image_present` | yes | the compose references the licensed `imageDigest` |
+| 4 | `quote_signature` | yes | Intel signed the quote |
+| 5 | `tcb_status` | yes | the platform's TCB is acceptable (ADR 0014, not configurable) |
+| 6 | `mr_config_id` | yes | the measured configuration is the licensed one |
+| 7 | `boot_measurements` | no | `MRTD`/`RTMR0–2` match a caller-supplied OS-image reference |
+| 8 | `channel_bound` | yes | **the quote is about the connection you are using** |
+
+Checks 1–6 are all satisfied by a genuine quote recorded from a CVM that no longer exists. Check 8
+is the one that is not: dStack's RA-TLS commits the connection's TLS key into the quote's
+`report_data`, so a relay presenting somebody else's quote fails it without holding the enclave's
+private key. Without it a hostile or buggy orchestrator can return a real `cvm_id`'s quote beside its
+own endpoint and every other check passes.
+
+Two consequences worth knowing before you wire this up:
+
+- **A verdict with no certificate behind it cannot be trustworthy.** Reading a quote out of a file
+  establishes what ran *somewhere*, never *what you are talking to*, and the verdict says so.
+- **dStack's default endpoint form cannot be channel bound.** The gateway terminates TLS on
+  `<app_id>-<port>.<domain>` and hands you a valid Let's Encrypt certificate for itself; only the
+  `s`-suffixed passthrough form reaches the enclave's own certificate. This crate refuses the
+  terminating form rather than falling back.
+
+Check 7 is not essential because it compares against a reference most callers do not have, so its
+absence is a legitimate configuration rather than a gap. `RTMR3` is never compared at all — see the
+three rules above.
+
 ## What a verdict tells you
 
 Never a bare boolean. Every verdict carries the verifier version, the reference-data date, and

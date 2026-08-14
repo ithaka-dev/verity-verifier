@@ -42,10 +42,22 @@ pub enum Check {
     MrConfigId,
     /// Boot measurements matched the expected OS image.
     BootMeasurements,
+    /// The quote commits to the certificate presented on the connection in use.
+    ///
+    /// The check that stops a genuine quote from being replayed beside an endpoint it never
+    /// attested. Every other check here can be satisfied by evidence recorded from a machine that
+    /// no longer exists; this one cannot.
+    ChannelBound,
 }
 
 impl Check {
     /// A stable identifier, suitable for telemetry.
+    ///
+    /// **These names are an interface twice over.** They are what F-09's alert groups by, and — via
+    /// [`transcript_line`] — they are what `closed-loop/04-refuses-on-mismatch.sh` and
+    /// `closed-loop/06-refuses-relayed-endpoint.sh` grep for. Renaming one breaks a dashboard and a
+    /// gate, and neither failure shows up in this crate's own tests unless a test pins the string.
+    /// `tests/verdict_semantics.rs` does.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -56,6 +68,7 @@ impl Check {
             Self::TcbStatus => "tcb_status",
             Self::MrConfigId => "mr_config_id",
             Self::BootMeasurements => "boot_measurements",
+            Self::ChannelBound => "channel_bound",
         }
     }
 
@@ -75,6 +88,16 @@ impl Check {
     /// supplies and most callers have none, so its absence is a legitimate configuration rather
     /// than a gap. That is the line, and `TcbStatus` was on the wrong side of it: TCB status always
     /// has an answer whenever a signature verified.
+    ///
+    /// **`ChannelBound` is here, on the same line of reasoning.** It sits where `BootMeasurements`
+    /// does not because every caller who opened a connection has a certificate to supply, and a
+    /// caller who opened none has not verified an endpoint at all — they have established what is
+    /// running somewhere. There is no configuration in which its absence is legitimate *and* the
+    /// verdict is about an endpoint, so "the caller had no reference for this" never applies.
+    ///
+    /// Without it in this list, every other check can be satisfied by a genuine quote recorded from
+    /// a CVM that has since been destroyed, presented beside an endpoint an attacker controls. That
+    /// is review finding CR-1, and this line is where it is refused.
     #[must_use]
     pub const fn essential() -> &'static [Self] {
         &[
@@ -84,6 +107,7 @@ impl Check {
             Self::QuoteSignature,
             Self::TcbStatus,
             Self::MrConfigId,
+            Self::ChannelBound,
         ]
     }
 }
@@ -114,6 +138,80 @@ impl Outcome {
     pub const fn passed(&self) -> bool {
         matches!(self, Self::Passed)
     }
+
+    /// The one-word transcript label: `passed`, `skipped` or `FAILED`.
+    ///
+    /// **This is a shell contract, not a display preference.**
+    /// `verity-foundation/closed-loop/04-refuses-on-mismatch.sh` and
+    /// `06-refuses-relayed-endpoint.sh` grep these exact words out of the runner's stdout. They are
+    /// the only end-to-end gates over this crate, and until this function existed the words lived in
+    /// an example binary where no test could reach them.
+    ///
+    /// `FAILED` is shouted and the other two are not, because a human skimming a transcript should
+    /// see a refusal without reading.
+    ///
+    /// Matched exhaustively and **without a wildcard**, deliberately. `Outcome` is
+    /// `#[non_exhaustive]`, but that only binds other crates — inside this one a new variant makes
+    /// this match a compile error, which forces whoever adds it to choose a word rather than
+    /// inherit a fallback. That is stronger than a wildcard, and the wildcard is what a downstream
+    /// renderer such as the WASM bindings has to write instead.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Skipped(_) => "skipped",
+            Self::Failed(_) => "FAILED",
+        }
+    }
+}
+
+/// One line of the runner's transcript, byte-identical to what `verify-attestation` prints.
+///
+/// # Why this is in the library
+///
+/// `verity-foundation/closed-loop/04-refuses-on-mismatch.sh` and `06-refuses-relayed-endpoint.sh`
+/// are the only end-to-end gates over this crate, and both decide pass or fail by grepping this
+/// exact layout out of the runner's stdout — `^  channel_bound +FAILED`, `^  compose_hash +FAILED`,
+/// `^  <name> +passed`, `^  channel_bound +skipped`.
+///
+/// While the format lived inside `examples/verify-attestation.rs` no test could reach it, so the
+/// two gates rested on an unasserted `println!`. This is the same split the WASM crate already made
+/// when `compose_only_verdict` came out of `verify_compose_only`: logic welded to a boundary a test
+/// cannot cross is logic nothing tests.
+///
+/// # Why it is not unified with `Verdict`'s `Display`
+///
+/// They render the same three outcomes differently, and that is on purpose.
+/// [`Verdict`]'s `Display` is for a human reading a refusal; this one is parsed by shell. The
+/// obvious future tidy-up — "why are there two renderers? unify them" — is green in every Rust test
+/// and silently breaks both gates. `tests/transcript_contract.rs` asserts that they differ, so that
+/// cleanup fails a test instead of passing a review.
+///
+/// # Format
+///
+/// ```
+/// use verity_verifier::verdict::{transcript_line, Check, Outcome};
+///
+/// assert_eq!(
+///     transcript_line(Check::ChannelBound, &Outcome::Passed),
+///     "  channel_bound          passed",
+/// );
+/// ```
+#[must_use]
+pub fn transcript_line(check: Check, outcome: &Outcome) -> String {
+    let label = outcome.label();
+    // A pass has nothing to explain; the other two carry the reason in parentheses. Rendering all
+    // three identically would report a *skipped* check as though it had concluded something — the
+    // collapse this crate refuses everywhere else, and the one F-09's alert is built on.
+    let rendered = match outcome {
+        Outcome::Passed => label.to_owned(),
+        Outcome::Failed(why) | Outcome::Skipped(why) => format!("{label} ({why})"),
+    };
+    // The literal space after `{:<22}` is what guarantees the scripts' `+` always has something to
+    // match, including for `licensed_image_present`, which is exactly 22 characters and so consumes
+    // the whole padding. The padding itself is alignment for a human reader — do not remove either
+    // and assume the other covers it.
+    format!("  {:<22} {rendered}", check.name())
 }
 
 /// The result of verifying an endpoint.

@@ -41,7 +41,44 @@ yaml-rust2 = "0.11"
 # makes TCB status enforcement mandatory and not configurable, and a feature flag that switches it
 # off is exactly the "strict mode someone leaves unset" that ADR forbids. CI asserts its absence.
 dcap-qvl = "0.6"
+# X.509 parsing, for one job: lifting the `SubjectPublicKeyInfo` out of the leaf certificate a
+# connection presented, so `report_data` can be compared against it (CR-1 channel binding).
+#
+# Pinned minor, like every other cryptography-adjacent dependency here. Three things about this
+# declaration are load-bearing and none of them is style:
+#
+# 1. **`default-features = false` matches `dcap-qvl`'s own declaration exactly.** Cargo unifies
+#    features per crate version across the whole graph, so turning defaults on here would switch
+#    `std` and `pem` on for *dcap-qvl's* copy too — widening a cryptographic dependency's surface
+#    from a line that reads like a convenience. Matching makes unification a no-op.
+# 2. **It is declared here, at the workspace, so the two declarations cannot drift apart** into the
+#    silent widening described above.
+# 3. **Not optional.** A feature that removes the ability to perform an essential check would ship a
+#    verifier whose `ChannelBound` is permanently unrun — fail-closed but useless. Cargo features
+#    must be additive; a gate that *removes* behaviour breaks the moment two crates in one build
+#    disagree. There is no coherent "verifier without channel binding" to gate.
+#
+# Chosen over `x509-parser` for strictness, not size: RustCrypto's `der` rejects non-canonical BER,
+# which is what makes decode-then-re-encode byte-exact and therefore what makes our hash equal the
+# one dStack computed over the same key. A lenient parser feeding a strict hash comparison is a
+# mismatch generator. On the `attest` build this costs zero new crates — `dcap-qvl 0.6.1` already
+# pulls x509-cert 0.3.
+x509-cert = { version = "0.3", default-features = false }
 proptest = "1"
+# PEM decoding for `examples/verify-attestation.rs` **only**, hence dev-only everywhere.
+#
+# Not `x509-cert`'s `pem` feature: `Certificate::from_pem` decodes to a struct, so getting DER back
+# out means `to_der()` — reintroducing in the example precisely the decode-then-re-encode round trip
+# the library design works to avoid. `decode_vec` hands back the DER bytes with no ASN.1 round trip.
+#
+# Not twenty lines of hand-rolled base64 either: the workspace already refuses hand-rolled scanners
+# for JSON and YAML on the grounds that a hand-written parser of structured input recreates the hole
+# it was written to close. That argument does not get weaker because the format is smaller, and this
+# is the file that feeds the crown-jewel check its input.
+#
+# 0.7 rather than 1: it is already in the graph via `spki 0.7` ← `dcap-qvl`, so this adds no crate
+# and no second major version.
+pem-rfc7468 = { version = "0.7", features = ["alloc"] }
 # Sync HTTP. Deliberately not an async client: the core verification path does no I/O, and
 # pulling tokio into a library agents embed would leak a runtime choice into their process.
 ureq = { version = "3", default-features = false, features = ["rustls"] }

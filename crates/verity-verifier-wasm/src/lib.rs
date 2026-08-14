@@ -16,6 +16,7 @@
 
 use serde::Serialize;
 use verity_verifier::binding::ComposeHash;
+use verity_verifier::channel::ChannelBinding;
 use verity_verifier::images;
 use verity_verifier::quote::Quote;
 use verity_verifier::verdict::Outcome;
@@ -144,6 +145,30 @@ pub fn check_mrconfigid(raw_quote: &[u8], licensed_compose_hash_hex: &str) -> Op
         .map(|e| e.to_string())
 }
 
+/// Check that a quote commits to the certificate a connection presented.
+///
+/// Returns `null` when the quote is about this connection, or a message describing why not. **A
+/// caller must treat a non-null result as a refusal**, not as advisory text — a genuine quote
+/// paired with somebody else's endpoint lands here, and it is the only check that can tell.
+///
+/// `leafCertDer` is the DER of the leaf from the TLS handshake **with the endpoint being judged**.
+/// These bindings perform no I/O and cannot check that provenance; a certificate from anywhere else
+/// yields a truthful answer about a connection you are not using.
+///
+/// This says nothing about whether Intel signed the quote — that needs collateral, and the Rust API.
+/// A forged quote whose `report_data` commits to the caller's own certificate passes this function.
+#[wasm_bindgen(js_name = checkChannelBinding)]
+#[must_use]
+pub fn check_channel_binding(raw_quote: &[u8], leaf_cert_der: &[u8]) -> Option<String> {
+    let quote = match Quote::parse(raw_quote) {
+        Ok(q) => q,
+        Err(e) => return Some(e.to_string()),
+    };
+    ChannelBinding::check(leaf_cert_der, &quote)
+        .err()
+        .map(|e| e.to_string())
+}
+
 /// Serialise a verdict for JavaScript.
 ///
 /// # Errors
@@ -155,27 +180,68 @@ fn verdict_to_value(v: &verity_verifier::verdict::Verdict) -> Result<JsValue, Js
 
 /// Verify compose-side checks and return a structured verdict.
 ///
+/// `verifyComposeOnly(document, licensedComposeHashHex, licensedImageDigest, rawQuote, leafCertDer?)`
+///
 /// Signature verification is **not** included here: it needs Intel collateral, and a binding that
 /// quietly omitted it while still returning a verdict would be the most dangerous thing in this
 /// crate. The omission is explicit in the returned verdict, where `quote_signature` is reported as
 /// skipped and the verdict is therefore not trustworthy.
 ///
+/// `leafCertDer` is optional and may be omitted, which arrives here as `None` — so existing
+/// JavaScript callers keep working, and their verdicts were already untrustworthy. Supplying it
+/// performs channel binding, which these bindings *can* do: it needs SHA-512 and an X.509 parse,
+/// not Intel collateral.
+///
 /// # Errors
 ///
 /// Returns a `JsValue` error if the verdict cannot be serialised.
+// `Option<Box<[u8]>>` and not `Option<&[u8]>`: wasm-bindgen's ABI for an *optional* byte slice
+// requires an owned value, because there is no nullable borrowed slice to hand across the boundary.
 #[wasm_bindgen(js_name = verifyComposeOnly)]
 pub fn verify_compose_only(
     document: &[u8],
     licensed_compose_hash_hex: &str,
     licensed_image_digest: &str,
     raw_quote: &[u8],
+    leaf_cert_der: Option<Box<[u8]>>,
 ) -> Result<JsValue, JsValue> {
-    verdict_to_value(&compose_only_verdict(
+    verdict_to_value(&compose_only_verdict_from_js_args(
         document,
         licensed_compose_hash_hex,
         licensed_image_digest,
         raw_quote,
+        leaf_cert_der,
     ))
+}
+
+/// The argument adapter between the JavaScript boundary and [`compose_only_verdict`].
+///
+/// **This exists as its own function so that a test can reach it.** `verify_compose_only` cannot be
+/// called from a native test at all — wasm-bindgen's imported functions panic off-target, which is
+/// the same reason `compose_only_verdict` was split out in the first place. While
+/// `leaf_cert_der.as_deref()` lived inside it, the single line deciding whether a JavaScript
+/// caller's certificate reaches the check was covered by nothing.
+///
+/// The failure that line can have is CR-1's own shape at the binding boundary: passing `None` here
+/// would skip channel binding for **every** JavaScript caller, silently, with an `isTrustworthy:
+/// false` that was already false for other reasons — so nothing downstream would look different.
+// The value is only read, which is what clippy objects to; the ownership is the boundary's
+// requirement rather than this function's, and this is the function that discharges it.
+#[allow(clippy::needless_pass_by_value)]
+fn compose_only_verdict_from_js_args(
+    document: &[u8],
+    licensed_compose_hash_hex: &str,
+    licensed_image_digest: &str,
+    raw_quote: &[u8],
+    leaf_cert_der: Option<Box<[u8]>>,
+) -> verity_verifier::verdict::Verdict {
+    compose_only_verdict(
+        document,
+        licensed_compose_hash_hex,
+        licensed_image_digest,
+        raw_quote,
+        leaf_cert_der.as_deref(),
+    )
 }
 
 /// The decisions behind [`verify_compose_only`], separated from the JavaScript boundary.
@@ -195,6 +261,7 @@ fn compose_only_verdict(
     licensed_compose_hash_hex: &str,
     licensed_image_digest: &str,
     raw_quote: &[u8],
+    leaf_cert_der: Option<&[u8]>,
 ) -> verity_verifier::verdict::Verdict {
     use verity_verifier::verdict::{Check, Verdict};
 
@@ -239,8 +306,34 @@ fn compose_only_verdict(
                     verdict = verdict.record(Check::MrConfigId, Outcome::Failed(e.to_string()));
                 }
             }
+            // Channel binding is performed here rather than declared impossible, because these
+            // bindings *can* perform it: it needs SHA-512 and an X.509 parse, not Intel collateral.
+            // Adding an essential check the bindings never recorded would have made them laxer than
+            // the core in the one dimension CR-1 is about, and a bare `Skipped` would have been an
+            // excuse rather than an answer.
+            match leaf_cert_der {
+                Some(der) => match ChannelBinding::check(der, &quote) {
+                    Ok(_) => verdict = verdict.record(Check::ChannelBound, Outcome::Passed),
+                    Err(e) => {
+                        verdict =
+                            verdict.record(Check::ChannelBound, Outcome::Failed(e.to_string()));
+                    }
+                },
+                None => {
+                    verdict = verdict.record(
+                        Check::ChannelBound,
+                        Outcome::Skipped(
+                            "no certificate supplied; channel binding was not attempted".to_owned(),
+                        ),
+                    );
+                }
+            }
         }
-        Err(e) => verdict = verdict.record(Check::MrConfigId, Outcome::Failed(e.to_string())),
+        Err(e) => {
+            verdict = verdict
+                .record(Check::MrConfigId, Outcome::Failed(e.to_string()))
+                .record(Check::ChannelBound, Outcome::Failed(e.to_string()));
+        }
     }
 
     // Both, and explicitly. `TcbStatus` used to be omitted rather than recorded, which left it as
@@ -249,6 +342,13 @@ fn compose_only_verdict(
     // legitimate, structural omission: TCB status is a property of the platform that signed the
     // quote, so it cannot be judged without the collateral needed to verify that signature. Saying
     // so keeps an honest skip distinguishable from a regression.
+    //
+    // **And this is what makes every other check here provisional, `channel_bound` included.**
+    // Nothing above establishes that Intel signed this quote, so an attacker who writes their own
+    // quote — with whatever `MR-CONFIG-ID` and whatever `report_data` commits to their own
+    // certificate — gets `passed` on both. That is not a defect being tolerated: it is why the
+    // verdict this function returns can never be trustworthy, and why the skips below are recorded
+    // rather than omitted.
     let needs_collateral = "needs Intel collateral; use the Rust API".to_owned();
     verdict
         .record(
@@ -281,7 +381,7 @@ mod tests {
         clippy::indexing_slicing
     )]
 
-    use super::{compose_only_verdict, to_js};
+    use super::{compose_only_verdict, compose_only_verdict_from_js_args, to_js};
     use verity_verifier::verdict::{Check, Outcome, Verdict};
 
     const COMPOSE: &[u8] =
@@ -298,6 +398,26 @@ mod tests {
             .collect()
     }
 
+    // The matched pair from CVM 9be9f370 — the quote lives inside the certificate. See
+    // `crates/verity-verifier/tests/fixtures/PROVENANCE.md`.
+    const RATLS_LEAF_PEM: &[u8] =
+        include_bytes!("../../verity-verifier/tests/fixtures/ratls-leaf-dstack-0.5.9.pem");
+    const RATLS_QUOTE_HEX: &str =
+        include_str!("../../verity-verifier/tests/fixtures/ratls-leaf-dstack-0.5.9.quote.hex");
+
+    fn ratls_quote_bytes() -> Vec<u8> {
+        let hex = RATLS_QUOTE_HEX.trim();
+        (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("fixture is hex"))
+            .collect()
+    }
+
+    fn ratls_leaf_der() -> Vec<u8> {
+        let (label, der) = pem_rfc7468::decode_vec(RATLS_LEAF_PEM).expect("fixture is PEM");
+        assert_eq!(label, "CERTIFICATE");
+        der
+    }
+
     fn outcome_of(verdict: &Verdict, check: Check) -> Option<&Outcome> {
         verdict.outcome(check)
     }
@@ -308,7 +428,7 @@ mod tests {
     /// reads as verified. The refusal is structural rather than a policy someone could relax.
     #[test]
     fn a_compose_only_verdict_is_never_trustworthy_even_when_everything_it_can_check_passes() {
-        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, &quote());
+        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, &quote(), None);
 
         assert_eq!(
             outcome_of(&verdict, Check::ComposeHash),
@@ -339,7 +459,7 @@ mod tests {
     /// from one. `TcbStatus` was absent here until T-11 made it essential.
     #[test]
     fn what_these_bindings_cannot_check_is_recorded_as_skipped_rather_than_left_out() {
-        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, &quote());
+        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, &quote(), None);
 
         for check in [Check::QuoteSignature, Check::TcbStatus] {
             match outcome_of(&verdict, check) {
@@ -358,13 +478,84 @@ mod tests {
         );
     }
 
+    /// The same obligation, for the essential that CR-1 added.
+    ///
+    /// `ChannelBound` joining `essential()` would have made the test above fail — a seventh
+    /// essential these bindings never recorded is a check that *vanished*, which is exactly the
+    /// regression `unrun_essentials` exists to surface. The wrong repair was to record a bare skip
+    /// and move on; these bindings can genuinely perform channel binding, so the omission has to be
+    /// a *declaration* about this call rather than about the bindings' capabilities.
+    #[test]
+    fn channel_binding_absent_is_recorded_rather_than_omitted() {
+        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, &quote(), None);
+
+        match outcome_of(&verdict, Check::ChannelBound) {
+            Some(Outcome::Skipped(why)) => assert!(
+                why.contains("no certificate supplied"),
+                "the skip must name what was missing, was {why:?}"
+            ),
+            other => panic!("channel_bound must be recorded as skipped, was {other:?}"),
+        }
+        assert!(
+            verdict.unrun_essentials().is_empty(),
+            "channel_bound must be declared, not left out"
+        );
+        assert!(!verdict.is_trustworthy());
+    }
+
+    /// The one line that decides whether a JavaScript caller's certificate reaches the check.
+    ///
+    /// `verify_compose_only` itself cannot be called natively — wasm-bindgen's imported functions
+    /// panic off-target — so the `as_deref()` adapter was covered by nothing until it was split into
+    /// `compose_only_verdict_from_js_args`. Dropping the certificate there would skip channel
+    /// binding for every JavaScript caller with no downstream symptom, since the verdict is
+    /// untrustworthy either way. Both arms are asserted, because only the difference between them
+    /// shows the argument arrived.
+    #[test]
+    fn a_certificate_supplied_from_javascript_reaches_the_check() {
+        let ratls_quote = ratls_quote_bytes();
+        let ratls_leaf: Box<[u8]> = ratls_leaf_der().into_boxed_slice();
+
+        let bound = compose_only_verdict_from_js_args(
+            COMPOSE,
+            LICENSED,
+            IMAGE,
+            &ratls_quote,
+            Some(ratls_leaf.clone()),
+        );
+        assert_eq!(
+            outcome_of(&bound, Check::ChannelBound),
+            Some(&Outcome::Passed),
+            "the certificate and the quote it carries must bind through the JS argument path"
+        );
+
+        let dropped =
+            compose_only_verdict_from_js_args(COMPOSE, LICENSED, IMAGE, &ratls_quote, None);
+        assert!(
+            matches!(
+                outcome_of(&dropped, Check::ChannelBound),
+                Some(Outcome::Skipped(_))
+            ),
+            "and omitting it must be the *only* way to get a skip"
+        );
+
+        // A certificate from elsewhere still refuses through the same path, so `Passed` above is the
+        // comparison succeeding rather than the argument being ignored.
+        let relayed =
+            compose_only_verdict_from_js_args(COMPOSE, LICENSED, IMAGE, &quote(), Some(ratls_leaf));
+        assert!(matches!(
+            outcome_of(&relayed, Check::ChannelBound),
+            Some(Outcome::Failed(_))
+        ));
+    }
+
     /// A compose that does not hash to the licensed value stops the examination: its contents are
     /// not evidence of anything, so reporting on them would be reporting on an attacker's document.
     #[test]
     fn a_wrong_compose_skips_the_checks_that_depend_on_it_rather_than_failing_them() {
         let mut tampered = COMPOSE.to_vec();
         tampered.push(b' ');
-        let verdict = compose_only_verdict(&tampered, LICENSED, IMAGE, &quote());
+        let verdict = compose_only_verdict(&tampered, LICENSED, IMAGE, &quote(), None);
 
         assert!(matches!(
             outcome_of(&verdict, Check::ComposeHash),
@@ -385,7 +576,7 @@ mod tests {
     /// caller's input, and a verifier that shrugged at it would pass every deployment.
     #[test]
     fn an_unreadable_licensed_hash_fails_the_compose_check_immediately() {
-        let verdict = compose_only_verdict(COMPOSE, "not-a-hash", IMAGE, &quote());
+        let verdict = compose_only_verdict(COMPOSE, "not-a-hash", IMAGE, &quote(), None);
         assert!(matches!(
             outcome_of(&verdict, Check::ComposeHash),
             Some(Outcome::Failed(_))
@@ -395,7 +586,7 @@ mod tests {
 
     #[test]
     fn an_unparseable_quote_fails_the_binding_check() {
-        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, b"not a quote");
+        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, b"not a quote", None);
         assert!(matches!(
             outcome_of(&verdict, Check::MrConfigId),
             Some(Outcome::Failed(_))
@@ -415,7 +606,7 @@ mod tests {
         .expect("json");
         let its_hash = super::ComposeHash::of(&tagged).to_string();
 
-        let verdict = compose_only_verdict(&tagged, &its_hash, IMAGE, &quote());
+        let verdict = compose_only_verdict(&tagged, &its_hash, IMAGE, &quote(), None);
         assert_eq!(
             outcome_of(&verdict, Check::ComposeHash),
             Some(&Outcome::Passed),
@@ -455,7 +646,13 @@ mod tests {
     /// alerts on, so a binding that renamed them would break telemetry silently.
     #[test]
     fn the_js_projection_carries_names_provenance_and_what_is_missing() {
-        let js = to_js(&compose_only_verdict(COMPOSE, LICENSED, IMAGE, &quote()));
+        let js = to_js(&compose_only_verdict(
+            COMPOSE,
+            LICENSED,
+            IMAGE,
+            &quote(),
+            None,
+        ));
 
         assert!(js.checks.iter().any(|c| c.check == "compose_hash"));
         assert!(!js.verifier_version.is_empty());

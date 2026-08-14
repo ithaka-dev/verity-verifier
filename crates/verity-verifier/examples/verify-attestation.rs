@@ -7,11 +7,36 @@
 //!
 //! ```text
 //! verify-attestation --attestation att.json --compose app-compose.json --image-digest sha256:…
+//!                    [--licensed-compose-hash <64 hex>]
+//!                    [--os-image dstack-0.5.9] [--boot-reference boot.json]
+//!                    [--endpoint https://…] [--leaf-cert leaf.pem]
 //! ```
+//!
+//! # `--licensed-compose-hash` decides whether check 1 means anything
+//!
+//! ADR 0009 step 2 compares the served document against the hash **the licence names**. Without this
+//! argument the runner has no licence to consult, so it derives the reference from the document it
+//! was just handed — comparing `sha256(doc)` with `sha256(doc)`, which passes for every input
+//! including a tampered one and would keep passing with `VerifiedCompose::check` deleted. The
+//! transcript says so out loud when that happens, because two closed-loop scripts grep
+//! `compose_hash passed` as a positive control and it was worth nothing to them.
 //!
 //! Exits 0 when the verdict is accepted and 1 when it is refused, so a shell harness can assert
 //! **both** directions. A run that only ever sees the good case cannot tell "the check passed" from
-//! "the check did not run".
+//! "the check did not run". Exit 2 means the run could not be performed at all — collateral could
+//! not be fetched, or a file named on the command line could not be read.
+//!
+//! # `--leaf-cert` decides whether this run means anything about an endpoint
+//!
+//! Without it, `channel_bound` is *skipped* and the verdict is untrustworthy however well the
+//! configuration checks go, because a quote read from a file establishes what ran somewhere and not
+//! what you are talking to. With it, the certificate must be the one the TLS handshake with
+//! `--endpoint` actually returned; this runner cannot check that and neither can the library.
+//!
+//! **The transcript format is a shell contract.** `closed-loop/04-refuses-on-mismatch.sh` and
+//! `06-refuses-relayed-endpoint.sh` grep the per-check lines below. They are rendered by
+//! `verity_verifier::verdict::transcript_line` rather than formatted here, so a crate test can pin
+//! the bytes — while the format lived in this file no test could reach it.
 
 // A CLI, not library code. `expect` on a missing argument *is* the correct behaviour here — the
 // caller gets a clear message and a non-zero exit — and the library's blanket denial of it exists
@@ -22,8 +47,10 @@ use std::process::ExitCode;
 
 use verity_verifier::attest::{Collateral, TcbPolicy};
 use verity_verifier::binding::ComposeHash;
+use verity_verifier::channel::PeerCertificate;
 use verity_verifier::quote::Measurement;
 use verity_verifier::reference::BootReference;
+use verity_verifier::verdict::transcript_line;
 use verity_verifier::verify::{verify, Evidence, LicensedVersion};
 
 fn arg(name: &str) -> Option<String> {
@@ -45,6 +72,12 @@ async fn main() -> ExitCode {
     // the same as passing, and is why `BootReference` uses `Option` per field rather than defaults.
     let os_image = arg("--os-image");
     let boot_reference_path = arg("--boot-reference");
+    // Optional, and the two are independent. `--endpoint` is provenance the library never sees;
+    // `--leaf-cert` is the only thing that makes this run a statement about a connection.
+    let endpoint = arg("--endpoint");
+    let leaf_cert_path = arg("--leaf-cert");
+    // Optional, and its absence is why check 1 can be vacuous. See `licensed_compose_hash`.
+    let licensed_compose_hash = arg("--licensed-compose-hash");
 
     // — the quote, raw, out of the RA-TLS leaf certificate —
     //
@@ -58,16 +91,60 @@ async fn main() -> ExitCode {
         .expect("app_certificates[0].quote");
     let raw_quote = hex_decode(quote_hex).expect("quote is hex");
 
-    // — the document we claim was licensed —
+    // — the document we claim was licensed, and what we claim was licensed —
     let compose_document = std::fs::read(&compose_path).expect("compose file");
+    let (compose_hash, compose_hash_is_self_referential) =
+        match licensed_hash(licensed_compose_hash.as_deref(), &compose_document) {
+            Ok(pair) => pair,
+            Err(why) => {
+                eprintln!("could not read --licensed-compose-hash: {why}");
+                return ExitCode::from(2);
+            }
+        };
     let licensed = LicensedVersion {
-        compose_hash: ComposeHash::of(&compose_document),
+        compose_hash,
         image_digest: image_digest.clone(),
+    };
+
+    // — the certificate the connection presented, if there was a connection —
+    //
+    // Read before anything expensive happens. A file-level problem must never fall through to
+    // `NotConnected`: that would silently turn "I could not read your certificate" into "channel
+    // binding was not attempted", and `06` would then fail with *refused, but not because of
+    // channel binding* — sending an operator after the wrong defect. Certificate **semantics** stay
+    // the library's: bytes that decode but are not a certificate go in and come back as
+    // `channel_bound FAILED`.
+    let leaf_cert_der = match leaf_cert_path.as_deref().map(load_leaf_certificate) {
+        None => None,
+        Some(Ok(der)) => Some(der),
+        Some(Err(why)) => {
+            eprintln!("could not read --leaf-cert: {why}");
+            return ExitCode::from(2);
+        }
     };
 
     println!("quote:          {} bytes", raw_quote.len());
     println!("compose:        {} bytes", compose_document.len());
     println!("licensed hash:  {}", licensed.compose_hash);
+    if compose_hash_is_self_referential {
+        // Said in the transcript rather than only in a comment, because two closed-loop scripts
+        // grep `compose_hash passed` as a positive control and both were doing it against a check
+        // that cannot fail. A reader of that transcript has to be able to see it.
+        //
+        // **`CANNOT FAIL` is a shell contract**, like the check names. `04` and `06` both grep for
+        // that exact string at their step 3 to catch `--licensed-compose-hash` being dropped or
+        // renamed — without it their positive control is decoration and they cannot tell. Changing
+        // these words means changing both scripts in the same commit.
+        println!(
+            "                ^ derived from the document itself — no --licensed-compose-hash was \
+             supplied, so check 1 compares sha256(doc) against sha256(doc) and CANNOT FAIL. It is \
+             not evidence. mr_config_id is what catches a tampered configuration in this run."
+        );
+    }
+    if let Some(endpoint) = endpoint.as_deref() {
+        println!("endpoint:       {endpoint}");
+        warn_if_tls_terminating(endpoint);
+    }
 
     // — collateral, fetched here so the library stays free of I/O —
     let client = dcap_qvl::collateral::CollateralClient::with_default_http(
@@ -103,6 +180,20 @@ async fn main() -> ExitCode {
     // caller-supplied JSON, and its absence leaves check 7 skipped rather than silently passing.
     let boot = boot_reference_path.as_deref().map(load_boot_reference);
 
+    // Absent means `PeerCertificate::NotConnected`, which is honest and which makes the verdict
+    // untrustworthy however well everything else goes. Said loudly and *before* the check list,
+    // because a reader who skims a wall of `passed` and stops at the bottom line should still have
+    // met the sentence that explains why the bottom line says REFUSED.
+    let peer_certificate = if let Some(der) = leaf_cert_der.as_deref() {
+        PeerCertificate::Presented(der)
+    } else {
+        println!(
+            "\nchannel binding: NOT ATTEMPTED — no --leaf-cert supplied; \
+             this run cannot establish what you are talking to."
+        );
+        PeerCertificate::NotConnected
+    };
+
     let verdict = verify(
         &licensed,
         &Evidence {
@@ -110,46 +201,14 @@ async fn main() -> ExitCode {
             compose_document,
             collateral: &collateral,
             now_secs,
+            peer_certificate,
         },
         boot.as_ref(),
         &TcbPolicy::default(),
     );
 
-    // Which comparisons actually ran, not only what they concluded. A verifier that quietly stops
-    // performing one still reports success; the list is the only place that shows.
-    println!("\nchecks performed:");
-    for (check, outcome) in verdict.results() {
-        // Passed, skipped and failed are three different things and must render as three. An
-        // earlier version of this example printed anything not-passed as FAILED, which reported a
-        // *skipped* boot-measurement check as a failure — collapsing exactly the distinction the
-        // library refuses to collapse, and the one F-09's alert is built on.
-        let rendered = match outcome {
-            verity_verifier::verdict::Outcome::Passed => "passed".to_owned(),
-            verity_verifier::verdict::Outcome::Skipped(why) => format!("skipped ({why})"),
-            verity_verifier::verdict::Outcome::Failed(why) => format!("FAILED ({why})"),
-            // `Outcome` is `#[non_exhaustive]`, so a future variant lands here rather than silently
-            // rendering as one of the three above.
-            other => format!("unrecognised outcome: {other:?}"),
-        };
-        println!("  {:<22} {rendered}", check.name());
-    }
-    // Only checks that genuinely never ran. `missing_essentials` also includes ones that ran and
-    // failed, so printing it here labelled a *failed* check as "NOT RUN" — the two are opposite
-    // situations and this is the display that has to keep them apart.
-    for unrun in verdict.unrun_essentials() {
-        println!("  {:<22} NOT RUN (essential)", unrun.name());
-    }
-
-    // Printed always, because there is no bundled source for these. Capturing them from a
-    // deployment you have independently satisfied yourself about is the only way a `--boot-reference`
-    // ever comes to exist.
-    if let Ok(quote) = verity_verifier::quote::Quote::parse(&raw_quote) {
-        println!("\nmeasured boot registers (a reference is captured, never derived):");
-        println!("  mrtd   {}", quote.mrtd());
-        for (index, rtmr) in quote.rtmrs().iter().enumerate().take(3) {
-            println!("  rtmr{index}  {rtmr}");
-        }
-    }
+    report_transcript(&verdict);
+    report_measured_registers(&raw_quote);
 
     if verdict.is_trustworthy() {
         println!("\nACCEPTED");
@@ -187,6 +246,158 @@ fn report_os_image(name: Option<&str>) -> bool {
             eprintln!("warning: `{name}` is not a known OS image; boot measurements unaffected");
             true
         }
+    }
+}
+
+/// Print which comparisons actually ran, not only what they concluded.
+///
+/// A verifier that quietly stops performing one still reports success; this list is the only place
+/// that shows. The per-check lines are rendered by the **library** rather than here: passed, skipped
+/// and failed are three different things and must render as three — an earlier version of this
+/// example printed anything not-passed as FAILED, reporting a *skipped* boot-measurement check as a
+/// failure. That logic now lives in `transcript_line`, where `tests/transcript_contract.rs` pins the
+/// exact bytes, because two closed-loop gates parse these lines and nothing could reach them while
+/// they were formatted in an example binary.
+fn report_transcript(verdict: &verity_verifier::verdict::Verdict) {
+    println!("\nchecks performed:");
+    for (check, outcome) in verdict.results() {
+        println!("{}", transcript_line(*check, outcome));
+    }
+    // Only checks that genuinely never ran. `missing_essentials` also includes ones that ran and
+    // failed, so printing that here labelled a *failed* check as "NOT RUN" — the two are opposite
+    // situations and this is the display that has to keep them apart.
+    for unrun in verdict.unrun_essentials() {
+        println!("  {:<22} NOT RUN (essential)", unrun.name());
+    }
+}
+
+/// Print the boot registers this deployment measured.
+///
+/// Always, because there is no bundled source for these. Capturing them from a deployment you have
+/// independently satisfied yourself about is the only way a `--boot-reference` ever comes to exist.
+/// `RTMR3` is deliberately not printed: it varies per boot, so showing it beside the others would
+/// invite someone to capture it as a reference.
+fn report_measured_registers(raw_quote: &[u8]) {
+    let Ok(quote) = verity_verifier::quote::Quote::parse(raw_quote) else {
+        return;
+    };
+    println!("\nmeasured boot registers (a reference is captured, never derived):");
+    println!("  mrtd   {}", quote.mrtd());
+    for (index, rtmr) in quote.rtmrs().iter().enumerate().take(3) {
+        println!("  rtmr{index}  {rtmr}");
+    }
+}
+
+/// Resolve the hash check 1 compares against, and say whether it is real evidence.
+///
+/// **The reference and the document are two different things, and conflating them is how check 1
+/// becomes decoration.** ADR 0009 step 2 compares the *served document* against the hash **the
+/// licence names**, which comes from an `AppManifest` version record — somewhere else entirely.
+/// Derive the reference from the document instead and you have compared `sha256(doc)` against
+/// `sha256(doc)`: a check that passes for every input including a tampered one, and that would keep
+/// passing with `VerifiedCompose::check` deleted outright.
+///
+/// That is the same defect as supplying both sides of the channel-binding comparison, one check
+/// earlier, and it is why `--licensed-compose-hash` exists.
+///
+/// Returns the hash and whether it was self-referential. This runner has no `AppManifest` to consult,
+/// so it cannot refuse to run without one — but it can, and does, say so in the transcript.
+fn licensed_hash(
+    supplied: Option<&str>,
+    compose_document: &[u8],
+) -> Result<(ComposeHash, bool), String> {
+    match supplied {
+        Some(hex) => ComposeHash::parse_hex(hex)
+            .map(|h| (h, false))
+            .map_err(|e| e.to_string()),
+        None => Ok((ComposeHash::of(compose_document), true)),
+    }
+}
+
+/// Read a leaf certificate as DER, accepting either PEM or DER on disk.
+///
+/// PEM is a container format and therefore belongs on this side of the I/O boundary: the library
+/// takes DER only. Decoding happens through `pem-rfc7468` rather than twenty lines of hand-rolled
+/// base64 — the workspace already refuses hand-rolled scanners for JSON and YAML, and that argument
+/// does not weaken because the format is smaller, least of all in the file that feeds the
+/// crown-jewel check its input.
+///
+/// Returns the reason as a string rather than exiting, so the caller can exit 2 with it. Every
+/// failure here is a *file* problem; certificate semantics are the library's to judge.
+fn load_leaf_certificate(path: &str) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+
+    // Sniffed, not guessed from the extension: operators name these files `.pem`, `.crt`, `.cer`
+    // and `.der` more or less at random, and the first bytes are unambiguous.
+    if !bytes.starts_with(b"-----BEGIN") {
+        return Ok(bytes);
+    }
+
+    let (label, der) =
+        pem_rfc7468::decode_vec(&bytes).map_err(|e| format!("{path} is not valid PEM: {e}"))?;
+    // A private key or a CSR in this argument is a mistake worth naming here. Passing its DER on
+    // would produce `channel_bound FAILED`, which is the correct verdict for the wrong reason and
+    // reads exactly like an attack.
+    if label != "CERTIFICATE" {
+        return Err(format!(
+            "{path} is a PEM `{label}` block, not a CERTIFICATE — \
+             --leaf-cert wants the leaf from the TLS handshake"
+        ));
+    }
+    Ok(der)
+}
+
+/// Warn when an endpoint uses dStack's TLS-*terminating* gateway form.
+///
+/// The gateway routes on an SNI suffix: `<app_id>-<port>s.<domain>` passes encrypted bytes through
+/// to the enclave, while `<app_id>-<port>.<domain>` — the form the platform advertises — has the
+/// gateway terminate TLS and present a valid Let's Encrypt certificate for *itself*. Ordinary TLS
+/// verification succeeds against it, so nothing looks wrong; the peer is simply not the enclave and
+/// channel binding cannot succeed.
+///
+/// **Advisory only.** It touches neither the verdict nor the exit code — the refusal is already
+/// produced by consequence, when the gateway's certificate fails to match the quote. This exists
+/// because that refusal is otherwise indistinguishable from an attack, and working that out cost
+/// four CVM runs.
+///
+/// Warns only on a *positive* match of the dangerous shape. Unrecognised hosts say nothing, or
+/// `06`'s `relay.attacker.example` would generate noise on every run.
+///
+/// The app-id length is pinned at **40 hex characters** rather than "some hex", because dStack's
+/// app-id is 20 bytes — `38817d24b2e3bd9cdeae1acc60aaec7ea0957d18`, recorded in
+/// `tests/fixtures/PROVENANCE.md`. Accepting any length made `ab-80.example.com` warn, and a
+/// diagnostic that cries wolf gets ignored on the day it is right. Observed firing on the real
+/// terminated host and staying silent on the real passthrough host from the same capture.
+fn warn_if_tls_terminating(endpoint: &str) {
+    /// dStack app-id: 20 bytes, rendered as hex.
+    const APP_ID_HEX_LEN: usize = 40;
+
+    // Deliberately not a URL parser: this is a hint, and a dependency for a hint is a bad trade.
+    let host = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    let Some((first_label, _)) = host.split_once('.') else {
+        return;
+    };
+    // `<40 hex chars>-<port>` terminates; `<40 hex chars>-<port>s` passes through. Splitting on the
+    // last `-` means the `s` suffix lands in `port`, where `is_ascii_digit` rejects it — which is
+    // exactly right: the passthrough form must not warn.
+    let Some((app_id, port)) = first_label.rsplit_once('-') else {
+        return;
+    };
+    let is_terminating_gateway = app_id.len() == APP_ID_HEX_LEN
+        && app_id.chars().all(|c| c.is_ascii_hexdigit())
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit());
+    if is_terminating_gateway {
+        eprintln!(
+            "warning: `{host}` is dStack's TLS-TERMINATING gateway form. The certificate you get \
+             from it belongs to the gateway, not the enclave, so channel binding cannot succeed. \
+             The passthrough form appends `s` to the port label: `{app_id}-{port}s.…`"
+        );
     }
 }
 

@@ -32,3 +32,6 @@ getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# The channel-binding fixtures are stored as PEM (the form an operator captures a certificate in);
+# the bindings take DER. Dev-only — nothing shipped to a JavaScript caller decodes PEM.
+pem-rfc7468 = { workspace = true }

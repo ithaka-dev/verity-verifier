@@ -371,3 +371,91 @@ fn implausible_signature_length_is_its_own_error() {
         other => panic!("expected a signature-length error, got {other:?}"),
     }
 }
+
+// — dstack 0.5.9, a second platform version —
+
+/// The quote carried inside the 0.5.9 RA-TLS leaf certificate. Same CVM, same boot, same key as
+/// `fixtures/ratls-leaf-dstack-0.5.9.pem` — see `fixtures/PROVENANCE.md` for the extraction.
+const QUOTE_HEX_059: &str = include_str!("fixtures/ratls-leaf-dstack-0.5.9.quote.hex");
+
+/// **A parse regression against a platform version this crate had never seen.**
+///
+/// Every other quote assertion in this file is about a dstack 0.5.7 capture. The structure is not
+/// guaranteed to be stable across guest images — 0.5.7 is no longer offered, and this project has
+/// already been caught conflating node runtime, guest image and dstack component versions — so a
+/// second version parsing through the same code is worth pinning rather than assuming.
+///
+/// It parsed unchanged, and **that is the finding**: no parser change was needed and none would
+/// have been licensed. Had it failed, the correct response was to stop and report a finding about
+/// 0.5.9's quote structure, never to loosen `Quote::parse` until it accepted.
+///
+/// The `report_data` assertions carry the same weight they do for 0.5.7, and one more: this quote's
+/// commitment has been reproduced from the certificate's own public key on real hardware, so the
+/// populated tail is evidence the scheme is SHA-512 rather than a shorter digest padded into the
+/// field. `tests/channel_binding.rs` does the reproducing.
+#[test]
+fn the_0_5_9_quote_parses_and_carries_a_populated_report_data() {
+    let bytes = decode(QUOTE_HEX_059);
+    let q = Quote::parse(&bytes).expect("the 0.5.9 fixture must parse with no parser change");
+
+    assert_eq!(q.version(), 4);
+    assert_eq!(
+        q.mrconfigid().as_bytes()[0],
+        0x01,
+        "V1 MR-CONFIG-ID construction, as on 0.5.7 — branch on this byte, never assume it"
+    );
+    assert_eq!(
+        hex(q.report_data().as_bytes()),
+        hex(&bytes[48 + 520..48 + 584]),
+        "read positionally from the fixture, not from the constant the parser also uses"
+    );
+    assert!(!q.report_data().is_zero());
+    assert!(
+        q.report_data().as_bytes()[48..].iter().any(|b| *b != 0),
+        "a 48-byte digest padded into 64 would leave this tail zero; SHA-512 does not"
+    );
+}
+
+// — the field we compare is the field Intel signed —
+
+/// **Closes the last gap between "Intel signed this quote" and "the bytes we compared are in it".**
+///
+/// `attest.rs` establishes that Intel's chain signs the quote. `channel.rs` compares `report_data`
+/// against the connection's certificate. Nothing until now connected the two: this crate reads
+/// `report_data` at offset 48+520 with its own hand-written offsets, and if that offset were wrong
+/// the channel-binding check would be comparing against 64 bytes of *something else in a genuine,
+/// correctly signed quote*. Every test would still pass — the fixture's own bytes are consistent
+/// with themselves — and the check would establish nothing.
+///
+/// So this cross-checks against `dcap-qvl`, which is the crate that verifies the signature and
+/// therefore the crate whose idea of "the report body" is the one Intel's signature covers. It
+/// decodes structurally, field by field, rather than by literal offsets, so agreement is genuine
+/// independent confirmation rather than two copies of the same constant.
+///
+/// Run over **both** platform versions, because the offset only has to be wrong on one of them.
+#[test]
+fn report_data_is_the_same_field_the_signature_verifier_reads() {
+    for (name, hex_fixture) in [("dstack-0.5.7", QUOTE_HEX), ("dstack-0.5.9", QUOTE_HEX_059)] {
+        let bytes = decode(hex_fixture);
+        let ours = Quote::parse(&bytes).expect("our parser");
+        let theirs = dcap_qvl::quote::Quote::parse(&bytes).expect("dcap-qvl parser");
+        let td = theirs
+            .report
+            .as_td10()
+            .expect("both fixtures are TDX 1.0 reports");
+
+        assert_eq!(
+            hex(ours.report_data().as_bytes()),
+            hex(&td.report_data),
+            "{name}: report_data must be the field the signature verifier reads"
+        );
+        // The same argument for the register the licence binds to, since it is read by the same
+        // hand-written offset chain and carries the same consequence if it is off.
+        assert_eq!(
+            hex(ours.mrconfigid().as_bytes()),
+            hex(&td.mr_config_id),
+            "{name}: MR-CONFIG-ID must be the field the signature verifier reads"
+        );
+        assert_eq!(hex(ours.mrtd().as_bytes()), hex(&td.mr_td), "{name}: MRTD");
+    }
+}

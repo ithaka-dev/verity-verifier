@@ -18,6 +18,7 @@
 
 use verity_verifier::attest::{Collateral, TcbPolicy};
 use verity_verifier::binding::ComposeHash;
+use verity_verifier::channel::PeerCertificate;
 use verity_verifier::quote::Quote;
 use verity_verifier::reference::BootReference;
 use verity_verifier::verdict::{Check, Outcome};
@@ -78,6 +79,12 @@ macro_rules! run {
                 compose_document: comp,
                 collateral: &c,
                 now_secs: 1_800_000_000,
+                // These are refusals about *configuration*, established from recorded evidence with
+                // no connection behind it. `NotConnected` is the honest input, and it means every
+                // verdict here is untrustworthy twice over — which is fine, because each test
+                // asserts the specific check it is about rather than the boolean. Channel binding
+                // has its own file, `tests/channel_binding.rs`.
+                peer_certificate: PeerCertificate::NotConnected,
             },
             None,
             &TcbPolicy::default(),

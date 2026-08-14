@@ -117,6 +117,7 @@ BINDING=crates/verity-verifier/src/binding.rs
 QUOTE=crates/verity-verifier/src/quote.rs
 IMAGES=crates/verity-verifier/src/images.rs
 VERDICT=crates/verity-verifier/src/verdict.rs
+CHANNEL=crates/verity-verifier/src/channel.rs
 
 echo "— the binding (C6: licensed_composeHash == attested_composeHash) —"
 
@@ -202,6 +203,66 @@ mutate "$VERDICT" \
   '.filter(|c| !self.outcome(*c).is_some_and(Outcome::passed))' \
   '.filter(|c| self.outcome(*c).is_some_and(|o| matches!(o, Outcome::Failed(_))))' \
   && run "a check that never ran no longer counts as missing"
+
+echo
+echo "— channel binding (CR-1) —"
+#
+# The finding these exist for: the verifier consumed the quote as a *detached artifact*, so a genuine
+# quote from a destroyed CVM paired with an attacker's endpoint passed every essential check. Every
+# other mutant in this file loosens a comparison between two recorded values; these loosen the only
+# comparison that says the recording is about the connection in front of you.
+
+# The comparison itself. If this survives, `ChannelBound` reports `passed` for any certificate and
+# CR-1 is back with a green test suite on top of it.
+mutate "$CHANNEL" \
+  'if commitment.0 == *report_data.as_bytes() {' 'if true {' \
+  && run "channel binding accepts any certificate"
+
+# ADR 0009 rule 3 again, in the new module: nobody deletes a check, they weaken a comparison. A
+# 32-byte prefix of a SHA-512 still looks like plenty to someone in a hurry.
+mutate "$CHANNEL" \
+  'if commitment.0 == *report_data.as_bytes() {' \
+  'if commitment.0[..32] == report_data.as_bytes()[..32] {' \
+  && run "commitment compared on its first 32 bytes only"
+
+# "The enclave committed to nothing" must never match an expectation that is also nothing. Delete
+# this guard and an all-zero `report_data` compares against a commitment nobody supplied — which is
+# what a quote requested for a non-certificate purpose carries.
+mutate "$CHANNEL" \
+  'if report_data.is_zero() {' 'if false {' \
+  && run "an all-zero report_data no longer refuses"
+
+# The trap dStack sets on genuine certificates: `cert_usage` reads `app:custom`, and a verifier that
+# took *that* as the commitment tag would refuse every legitimate application certificate. Observed
+# on hardware, so this mutant is a real mistake rather than an invented one.
+mutate "$CHANNEL" \
+  'const RATLS_TAG: &str = "ratls-cert";' \
+  'const RATLS_TAG: &str = "app:custom";' \
+  && run "the commitment tag taken from cert_usage instead of being fixed"
+
+mutate "$VERDICT" \
+  '            Self::ChannelBound,
+' '' \
+  && run "channel binding dropped from the essential checks"
+
+# — the two shell gates, which `cargo test` cannot run —
+#
+# `04-refuses-on-mismatch.sh` and `06-refuses-relayed-endpoint.sh` grep the runner's stdout. Both
+# edits below are invisible to every behavioural test in this crate and turn a gate red — or worse,
+# green for the wrong reason — so they are scored here.
+
+# The check name is an identifier in two scripts and in F-09's alert, not just a display string.
+mutate "$VERDICT" \
+  'Self::ChannelBound => "channel_bound",' 'Self::ChannelBound => "channelBound",' \
+  && run "the channel_bound identifier renamed under two shell gates"
+
+# The *rendering* version of "a skip read as a pass". The verdict-level mutant above covers the
+# semantics — `Outcome::passed` returning true for a skip — and this covers the word printed. They
+# have different blast radii: this one leaves `is_trustworthy` correct while making `04` step 3's
+# `channel_bound skipped` grep fail and `06`'s `passed` greps succeed spuriously.
+mutate "$VERDICT" \
+  'Self::Skipped(_) => "skipped",' 'Self::Skipped(_) => "passed",' \
+  && run "a skipped check rendered as passed in the runner transcript"
 
 echo
 echo "— known equivalent —"

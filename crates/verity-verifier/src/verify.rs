@@ -6,6 +6,7 @@
 
 use crate::attest::{self, Collateral, TcbPolicy};
 use crate::binding::{check_mrconfigid, ComposeHash, VerifiedCompose};
+use crate::channel::{ChannelBinding, PeerCertificate};
 use crate::images;
 use crate::quote::Quote;
 use crate::reference::{check_boot_measurements, BootReference};
@@ -35,6 +36,43 @@ pub struct Evidence<'a> {
     pub collateral: &'a Collateral,
     /// Verification time, as a Unix timestamp.
     pub now_secs: u64,
+    /// The certificate presented on the connection this verdict is about.
+    ///
+    /// **Has no default, on purpose.** Adding this field broke every existing construction site,
+    /// and that break is the feature: a `Default` or an `Option` silently meaning "skip" would let
+    /// integrations keep compiling while establishing nothing about the endpoint — the precise
+    /// shape of CR-1. Spell [`PeerCertificate::NotConnected`] to opt out, and read `REFUSED`.
+    pub peer_certificate: PeerCertificate<'a>,
+}
+
+/// Step 8: is this quote about the connection in front of us?
+///
+/// Every other check `verify` performs is satisfied by evidence recorded from a machine that no
+/// longer exists — a genuine quote from a destroyed CVM still hashes correctly and still carries the
+/// licensed `MR-CONFIG-ID`. This one is not: `report_data` carries the enclave's commitment to its
+/// own TLS key, and a relay cannot reproduce it without the enclave's private key, at which point it
+/// would be the enclave rather than a relay.
+///
+/// The comparison itself lives in [`ChannelBinding::check`] rather than here, so that it cannot be
+/// performed without the all-zero refusal that precedes it.
+fn channel_bound(peer: PeerCertificate<'_>, quote: &Quote) -> Outcome {
+    match peer {
+        PeerCertificate::Presented(leaf_cert_der) => {
+            match ChannelBinding::check(leaf_cert_der, quote) {
+                Ok(_) => Outcome::Passed,
+                Err(e) => Outcome::Failed(e.to_string()),
+            }
+        }
+        // Recorded, not omitted. `ChannelBound` is essential, so this already sinks
+        // `is_trustworthy` — but saying *why* keeps an honest offline audit distinguishable from a
+        // verifier that silently stopped performing the check, which is the distinction
+        // `unrun_essentials` exists for.
+        PeerCertificate::NotConnected => Outcome::Skipped(
+            "no connection was made: this verdict is about recorded evidence, \
+             not about an endpoint"
+                .to_owned(),
+        ),
+    }
 }
 
 /// Verify an endpoint against what was licensed.
@@ -148,12 +186,22 @@ pub fn verify(
                     );
                 }
             }
+            // 8. Is this quote about the connection in front of us?
+            verdict = verdict.record(
+                Check::ChannelBound,
+                channel_bound(evidence.peer_certificate, &quote),
+            );
         }
         Err(e) => {
             let why = format!("quote could not be parsed: {e}");
             verdict = verdict
                 .record(Check::MrConfigId, Outcome::Failed(why.clone()))
-                .record(Check::BootMeasurements, Outcome::Skipped(why));
+                .record(Check::BootMeasurements, Outcome::Skipped(why.clone()))
+                // `Failed`, not `Skipped`, and for the same reason `MrConfigId` is: the evidence
+                // itself is unusable. `Skipped` in this crate means "considered and declined for a
+                // legitimate reason", and an unparseable quote is not one — reporting it as a skip
+                // would read as an ordinary configuration gap.
+                .record(Check::ChannelBound, Outcome::Failed(why));
         }
     }
 
