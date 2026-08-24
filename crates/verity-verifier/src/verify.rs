@@ -5,12 +5,12 @@
 //! cannot forget a step.
 
 use crate::attest::{self, Collateral, TcbPolicy};
-use crate::binding::{check_mrconfigid, ComposeHash, VerifiedCompose};
+use crate::binding::{check_mrconfigid, ComposeHash, MrConfigIdError, VerifiedCompose};
 use crate::channel::{ChannelBinding, PeerCertificate};
 use crate::images;
 use crate::quote::Quote;
 use crate::reference::{check_boot_measurements, BootReference};
-use crate::verdict::{Check, Outcome, Verdict};
+use crate::verdict::{Check, Outcome, Unestablished, Verdict};
 
 /// What a licence names, read from an `AppManifest` version record.
 #[derive(Debug, Clone)]
@@ -43,6 +43,27 @@ pub struct Evidence<'a> {
     /// integrations keep compiling while establishing nothing about the endpoint — the precise
     /// shape of CR-1. Spell [`PeerCertificate::NotConnected`] to opt out, and read `REFUSED`.
     pub peer_certificate: PeerCertificate<'a>,
+}
+
+/// Step 6: does the measured configuration match the licensed one?
+///
+/// Extracted so [`verify`] stays readable — this is the one arm MA-6 gave a third outcome to.
+fn mrconfigid_outcome(measured: &crate::quote::Measurement, licensed: &ComposeHash) -> Outcome {
+    match check_mrconfigid(measured, licensed) {
+        Ok(()) => Outcome::Passed,
+        // Recognised, but this verifier cannot yet compute a reference for it: our limitation,
+        // with a named remedy — run a build that supports V2 — and nothing attacker-influenced
+        // about it. Distinct from `UnknownVersion` below, which is any unrecognised prefix
+        // including all-zero (an unpopulated field): there is no remedy to name for evidence we
+        // cannot account for, so that arm stays `Failed`. Drawing the line the other way would let
+        // an unaccountable measurement disposition to "update your verifier".
+        Err(e @ MrConfigIdError::UnsupportedVersion { .. }) => {
+            Outcome::unestablished(Unestablished::VerifierCannotJudge, e.to_string())
+        }
+        // `Mismatch` and `UnknownVersion` both reached a refusal: one is a measurement that does
+        // not match, the other is a prefix byte this crate cannot account for at all.
+        Err(e) => Outcome::Failed(e.to_string()),
+    }
 }
 
 /// Step 8: is this quote about the connection in front of us?
@@ -180,12 +201,10 @@ pub fn verify(
     // 6. Does the measured configuration match the licensed one?
     match Quote::parse(evidence.raw_quote) {
         Ok(quote) => {
-            match check_mrconfigid(quote.mrconfigid(), &licensed.compose_hash) {
-                Ok(()) => verdict = verdict.record(Check::MrConfigId, Outcome::Passed),
-                Err(e) => {
-                    verdict = verdict.record(Check::MrConfigId, Outcome::Failed(e.to_string()));
-                }
-            }
+            verdict = verdict.record(
+                Check::MrConfigId,
+                mrconfigid_outcome(quote.mrconfigid(), &licensed.compose_hash),
+            );
             // 7. Boot measurements, when the caller supplied a reference.
             //
             // RTMR3 is absent from BootReference by construction and cannot be compared here.
@@ -198,9 +217,16 @@ pub fn verify(
                     }
                 },
                 None => {
+                    // Indeterminate, not Skipped: a named remedy applies to this same call — supply
+                    // a reference and call `verify` again with it. `BootMeasurements` is advisory,
+                    // so this does not by itself sink the verdict, but it is no longer silent about
+                    // there being an action available.
                     verdict = verdict.record(
                         Check::BootMeasurements,
-                        Outcome::Skipped("no OS image reference supplied".to_owned()),
+                        Outcome::unestablished(
+                            Unestablished::ReferenceUnavailable,
+                            "no OS image reference supplied",
+                        ),
                     );
                 }
             }
@@ -214,11 +240,16 @@ pub fn verify(
             let why = format!("quote could not be parsed: {e}");
             verdict = verdict
                 .record(Check::MrConfigId, Outcome::Failed(why.clone()))
+                // `Skipped`, not `Indeterminate`: `MrConfigId` already reached a refusal for this
+                // exact reason, so nothing here is a remedy — a caller cannot retry into a
+                // different answer. Moot, not unestablished.
                 .record(Check::BootMeasurements, Outcome::Skipped(why.clone()))
-                // `Failed`, not `Skipped`, and for the same reason `MrConfigId` is: the evidence
-                // itself is unusable. `Skipped` in this crate means "considered and declined for a
-                // legitimate reason", and an unparseable quote is not one — reporting it as a skip
-                // would read as an ordinary configuration gap.
+                // `Failed`, not `Skipped`: an unparseable quote presented as an endpoint's
+                // attestation is a refusal in its own right. `Failed` throughout this file means
+                // "the check reached a refusal" — contrast `channel_bound` above, where
+                // `NotConnected` stays `Skipped` because there the caller declined and no property
+                // was evaluated either way. Here the evidence itself is unusable, which is what
+                // makes this a refusal rather than a decline.
                 .record(Check::ChannelBound, Outcome::Failed(why));
         }
     }

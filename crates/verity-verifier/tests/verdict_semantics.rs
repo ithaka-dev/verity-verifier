@@ -14,7 +14,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use verity_verifier::verdict::{Check, Outcome, Verdict};
+use verity_verifier::verdict::{disposition, Check, Disposition, Outcome, Unestablished, Verdict};
 
 /// A verdict with every essential check passing, and nothing else.
 fn all_essentials_pass() -> Verdict {
@@ -45,6 +45,10 @@ fn failed(why: &str) -> Outcome {
 
 fn skipped(why: &str) -> Outcome {
     Outcome::Skipped(why.to_owned())
+}
+
+fn unestablished(cause: Unestablished, why: &str) -> Outcome {
+    Outcome::unestablished(cause, why)
 }
 
 // — the baseline —
@@ -356,11 +360,20 @@ fn display_renders_pass_fail_and_skip_as_three_distinct_things() {
         .record(Check::ComposeHash, Outcome::Passed)
         .record(Check::ImagesPinned, failed("tag-referenced image"))
         .record(Check::LicensedImagePresent, skipped("compose not examined"))
+        .record(
+            Check::BootMeasurements,
+            unestablished(Unestablished::ReferenceUnavailable, "no reference"),
+        )
         .to_string();
 
-    assert!(rendered.contains("pass    compose_hash"));
-    assert!(rendered.contains("FAIL    images_pinned: tag-referenced image"));
-    assert!(rendered.contains("skipped licensed_image_present: compose not examined"));
+    // The label field widened from 8 to 14 columns to fit `indeterminate` (13 characters) with at
+    // least one separating space — see the module doc on `Display for Verdict`. These two literals
+    // are *supposed* to break when the width changes: they pin the human rendering, and a test that
+    // did not notice the width move would be the defect.
+    assert!(rendered.contains("pass          compose_hash"));
+    assert!(rendered.contains("FAIL          images_pinned: tag-referenced image"));
+    assert!(rendered.contains("skipped       licensed_image_present: compose not examined"));
+    assert!(rendered.contains("indeterminate boot_measurements: no reference"));
     assert!(
         rendered.contains("verity-verifier"),
         "the verifier's own version belongs in anything a human reads"
@@ -417,4 +430,189 @@ fn check_names_are_stable_identifiers() {
             "Display must agree with the telemetry name"
         );
     }
+}
+
+// — MA-6: `Indeterminate` and `disposition` —
+//
+// T-1 through T-8, T-18. Each negative below was produced by making the change described and
+// watching the assertion fail, then reverting it — see the developer's report for the transcripts.
+
+/// T-1: an essential `Indeterminate` is not trustworthy, and — unlike `Failed`/`Skipped` — it is
+/// still excluded from `missing_essentials` today only *because* the filter is `!passed`. Pinned so
+/// a future rewrite of that filter (e.g. onto an explicit match) cannot silently readmit it.
+#[test]
+fn an_indeterminate_essential_is_not_trustworthy_and_is_missing() {
+    let verdict = essentials_with(
+        Check::TcbStatus,
+        &unestablished(Unestablished::RetrievalFailed, "gateway timed out"),
+    );
+    assert!(!verdict.is_trustworthy());
+    assert_eq!(verdict.missing_essentials(), vec![Check::TcbStatus]);
+}
+
+/// T-2: `Indeterminate` **never** appears in `unrun_essentials` — it was recorded, so the check ran.
+/// Holds today with no code change (`unrun_essentials` filters on absence, not on outcome shape),
+/// which is exactly why it needs pinning: the property is incidental to the current
+/// implementation, not required by any type.
+#[test]
+fn an_indeterminate_essential_is_not_unrun() {
+    let verdict = essentials_with(
+        Check::TcbStatus,
+        &unestablished(Unestablished::RetrievalFailed, "gateway timed out"),
+    );
+    assert!(
+        verdict.unrun_essentials().is_empty(),
+        "a recorded Indeterminate was considered, so it is not unrun"
+    );
+}
+
+/// T-3: `Indeterminate` is not a failure, and does not read as passed. The negative is free: adding
+/// `Outcome::Indeterminate { detail: why, .. }` to `failures()`'s match arm makes this go red with
+/// `was [(BootMeasurements, "no reference")]`, and `Outcome::Indeterminate { .. }.passed()` would
+/// answer `true` if `passed` matched a struct-variant field instead of only `Self::Passed`.
+#[test]
+fn an_indeterminate_outcome_is_not_a_failure_and_is_not_passed() {
+    let outcome = unestablished(Unestablished::ReferenceUnavailable, "no reference");
+    let verdict = Verdict::new().record(Check::BootMeasurements, outcome.clone());
+
+    assert!(
+        verdict.failures().is_empty(),
+        "Indeterminate must not appear in failures()"
+    );
+    assert!(!outcome.passed());
+}
+
+/// T-4: `disposition` needs *both* arguments — this is the only row where the `Check` argument does
+/// any work. The same `Outcome::Skipped` is `ProceedNonEssential` on the one advisory check and
+/// `Refuse` on every essential one.
+#[test]
+fn skipped_dispositions_differently_by_weight() {
+    assert_eq!(
+        disposition(Check::BootMeasurements, &skipped("no reference")),
+        Disposition::ProceedNonEssential
+    );
+    for check in Check::essential() {
+        assert_eq!(
+            disposition(*check, &skipped("moot")),
+            Disposition::Refuse,
+            "{check} is essential, so a skip must disposition to Refuse"
+        );
+    }
+}
+
+/// T-5: `disposition`'s private weight table must agree with `Check::essential()` for every check —
+/// the duplication the design accepts rather than deriving one from the other (deriving would
+/// silently classify a future `Check` variant as advisory, the fail-open default).
+#[test]
+fn every_check_disposition_agrees_with_essential_on_a_skip() {
+    for check in Check::ALL {
+        let is_essential = Check::essential().contains(check);
+        let advises_proceeding =
+            disposition(*check, &skipped("x")) == Disposition::ProceedNonEssential;
+        assert_eq!(
+            advises_proceeding, !is_essential,
+            "{check}: essential() and disposition()'s weight table disagree"
+        );
+    }
+}
+
+/// T-7 (restated from the unstatable form in the design's own review): no disposition ever advises
+/// proceeding — `Satisfied` or `ProceedNonEssential` — on an essential check that did not pass. One
+/// loop over every essential and every non-passing outcome shape.
+#[test]
+fn no_disposition_ever_advises_proceeding_on_a_non_passing_essential() {
+    let non_passing = [
+        failed("x"),
+        skipped("x"),
+        unestablished(Unestablished::RetrievalFailed, "x"),
+        unestablished(Unestablished::ReferenceUnavailable, "x"),
+        unestablished(Unestablished::VerifierCannotJudge, "x"),
+    ];
+    for check in Check::essential() {
+        for outcome in &non_passing {
+            let d = disposition(*check, outcome);
+            assert!(
+                !matches!(d, Disposition::Satisfied | Disposition::ProceedNonEssential),
+                "{check} {outcome:?} -> {d:?} advises proceeding on a non-passing essential"
+            );
+        }
+    }
+}
+
+/// T-8: the disposition table, as literal data — not re-derived from the implementation. Flipping a
+/// single arm of `disposition()` must turn exactly one of these rows red; two red means the
+/// literals were copied from the implementation rather than written independently, and zero red
+/// means the test asserts `f(x) == f(x)`.
+///
+/// (Written from the negative: mapping `(Essential, Skipped)` to `ProceedNonEssential` was tried
+/// against this table and it failed on every essential row, as expected — restored before writing
+/// the final version below.)
+#[test]
+fn the_disposition_table_is_pinned_by_literal_not_by_rederivation() {
+    let essential = Check::ComposeHash; // any essential check exercises the same row
+    let advisory = Check::BootMeasurements;
+
+    let cases: &[(Check, Outcome, Disposition)] = &[
+        (essential, Outcome::Passed, Disposition::Satisfied),
+        (advisory, Outcome::Passed, Disposition::Satisfied),
+        (essential, failed("x"), Disposition::Refuse),
+        (advisory, failed("x"), Disposition::Refuse),
+        (essential, skipped("x"), Disposition::Refuse),
+        (advisory, skipped("x"), Disposition::ProceedNonEssential),
+        (
+            essential,
+            unestablished(Unestablished::RetrievalFailed, "x"),
+            Disposition::RetryRetrieval,
+        ),
+        (
+            advisory,
+            unestablished(Unestablished::RetrievalFailed, "x"),
+            Disposition::RetryRetrieval,
+        ),
+        (
+            essential,
+            unestablished(Unestablished::ReferenceUnavailable, "x"),
+            Disposition::UpdateReference,
+        ),
+        (
+            advisory,
+            unestablished(Unestablished::ReferenceUnavailable, "x"),
+            Disposition::UpdateReference,
+        ),
+        (
+            essential,
+            unestablished(Unestablished::VerifierCannotJudge, "x"),
+            Disposition::UpdateVerifier,
+        ),
+        (
+            advisory,
+            unestablished(Unestablished::VerifierCannotJudge, "x"),
+            Disposition::UpdateVerifier,
+        ),
+    ];
+
+    for (check, outcome, expected) in cases {
+        assert_eq!(
+            disposition(*check, outcome),
+            *expected,
+            "{check} {outcome:?}"
+        );
+    }
+}
+
+/// T-18: `Disposition::Refuse` can appear on a verdict that is still trustworthy.
+/// `(BootMeasurements, Failed)` dispositions to `Refuse` — a measured discrepancy is a refusal
+/// whatever else passed — while `is_trustworthy()` stays `true`, because `BootMeasurements` is
+/// advisory. Pinned so the next reader does not "fix" this into `ProceedNonEssential` on the belief
+/// that a trustworthy verdict cannot carry a refusal.
+#[test]
+fn a_trustworthy_verdict_can_still_carry_a_refuse_disposition() {
+    let verdict =
+        all_essentials_pass().record(Check::BootMeasurements, failed("MRTD did not match"));
+
+    assert!(verdict.is_trustworthy());
+    assert_eq!(
+        verdict.disposition(Check::BootMeasurements),
+        Some(Disposition::Refuse)
+    );
 }

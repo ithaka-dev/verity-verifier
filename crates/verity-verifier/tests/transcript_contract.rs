@@ -46,7 +46,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use verity_verifier::verdict::{transcript_line, Check, Outcome, Verdict};
+use verity_verifier::verdict::{transcript_line, Check, Outcome, Unestablished, Verdict};
 
 /// The exact `grep -qE` patterns the two scripts run, transcribed here so a change to the format
 /// has to confront them. Kept as strings and matched by hand rather than by a regex dependency —
@@ -141,14 +141,18 @@ fn the_runner_transcript_is_a_shell_contract_two_closed_loop_gates_parse() {
     ));
 }
 
-/// A pass has nothing to explain; the other two carry their reason. Rendering all three the same
-/// way would report a *skipped* check as though it had concluded something — the collapse this
-/// crate refuses everywhere else, and the distinction F-09's alert is built on.
+/// A pass has nothing to explain; the other three carry their reason. Rendering them the same way
+/// would report a check that did not conclude as though it had — the collapse this crate refuses
+/// everywhere else, and the distinction F-09's alert is built on.
 #[test]
-fn a_pass_carries_no_detail_and_the_other_two_do() {
+fn a_pass_carries_no_detail_and_the_others_do() {
     assert_eq!(Outcome::Passed.label(), "passed");
     assert_eq!(Outcome::Failed(String::new()).label(), "FAILED");
     assert_eq!(Outcome::Skipped(String::new()).label(), "skipped");
+    assert_eq!(
+        Outcome::unestablished(Unestablished::RetrievalFailed, "").label(),
+        "indeterminate"
+    );
 
     assert!(!transcript_line(Check::TcbStatus, &Outcome::Passed).contains('('));
     assert!(
@@ -160,6 +164,53 @@ fn a_pass_carries_no_detail_and_the_other_two_do() {
         &Outcome::Skipped("no collateral".to_owned())
     )
     .contains("(no collateral)"));
+    assert!(transcript_line(
+        Check::TcbStatus,
+        &Outcome::unestablished(Unestablished::RetrievalFailed, "gateway timed out")
+    )
+    .contains("(gateway timed out)"));
+}
+
+/// T-10: the fourth transcript word, `indeterminate`, byte for byte — and the specific pattern `04`
+/// will grep once it exercises the no-boot-reference path (`boot: None` is the default; T-9 in
+/// `reference_and_verdict.rs` pins that `verify()` actually produces this outcome there).
+#[test]
+fn the_fourth_word_is_indeterminate_and_matches_the_pattern_04_will_grep() {
+    assert_eq!(
+        transcript_line(
+            Check::BootMeasurements,
+            &Outcome::unestablished(
+                Unestablished::ReferenceUnavailable,
+                "no OS image reference supplied"
+            )
+        ),
+        "  boot_measurements      indeterminate (no OS image reference supplied)"
+    );
+    assert!(matches_grep(
+        &transcript_line(
+            Check::BootMeasurements,
+            &Outcome::unestablished(Unestablished::ReferenceUnavailable, "no reference")
+        ),
+        "boot_measurements",
+        "indeterminate"
+    ));
+
+    // Four distinct words, none a prefix of another in a way `matches_grep`'s `starts_with` could
+    // confuse — `label()` is `#[non_exhaustive]`-safe (a compile error forces a choice for a fifth
+    // variant), but this pins the *values* rather than only the compiler's coverage of them.
+    let labels: std::collections::BTreeSet<&str> = [
+        Outcome::Passed.label(),
+        Outcome::Failed(String::new()).label(),
+        Outcome::Skipped(String::new()).label(),
+        Outcome::unestablished(Unestablished::RetrievalFailed, "").label(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        labels.len(),
+        4,
+        "all four transcript words must be distinct"
+    );
 }
 
 /// **The answer to "why are there two renderers?", written as a test.**
@@ -179,7 +230,7 @@ fn the_human_display_and_the_machine_transcript_are_deliberately_different() {
     let machine = transcript_line(Check::ComposeHash, &Outcome::Passed);
 
     assert!(
-        human.contains("  pass    compose_hash"),
+        human.contains("  pass          compose_hash"),
         "the human display leads with the outcome: {human}"
     );
     assert_eq!(machine, "  compose_hash           passed");
@@ -190,17 +241,31 @@ fn the_human_display_and_the_machine_transcript_are_deliberately_different() {
     );
 }
 
-/// The rendering is what the WASM bindings' outcome strings agree with, and what a JavaScript
-/// caller sees under a different name. Pinned here so the two surfaces cannot drift into disagreeing
-/// about what a skip is called.
+/// **Not a cross-surface drift guard — this crate does not depend on `verity-verifier-wasm`, so
+/// nothing here can observe it.** It would pass even if `to_js` were deleted, which is exactly what
+/// was found while implementing MA-6: the guard this test's name promises does not exist here and
+/// cannot, because the WASM crate is not in scope. The real guard —
+/// `verity-verifier-wasm`'s `the_wasm_outcome_string_stays_in_lockstep_with_the_core_label_for_every_outcome`
+/// — asserts `to_js(...).outcome == Outcome::label().to_lowercase()` for all four variants, in the
+/// one crate where both surfaces are actually visible.
+///
+/// What this test *can* still pin, honestly: `Outcome::label()`'s own values, lower-cased, which is
+/// the string `to_js` is documented to reproduce.
 #[test]
-fn the_labels_match_the_words_the_javascript_bindings_report() {
-    // `to_js` maps Passed/Failed/Skipped to "passed"/"failed"/"skipped". Only `FAILED` differs, and
-    // it differs in case alone — shouted in a human transcript, lower-case in a JSON field.
-    assert_eq!(Outcome::Passed.label(), "passed");
-    assert_eq!(Outcome::Skipped(String::new()).label(), "skipped");
+fn label_lowercased_is_the_string_the_javascript_bindings_are_documented_to_report() {
+    assert_eq!(Outcome::Passed.label().to_lowercase(), "passed");
+    assert_eq!(
+        Outcome::Skipped(String::new()).label().to_lowercase(),
+        "skipped"
+    );
     assert_eq!(
         Outcome::Failed(String::new()).label().to_lowercase(),
         "failed"
+    );
+    assert_eq!(
+        Outcome::unestablished(Unestablished::RetrievalFailed, "")
+            .label()
+            .to_lowercase(),
+        "indeterminate"
     );
 }

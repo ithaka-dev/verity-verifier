@@ -53,7 +53,7 @@ use crate::channel::ChannelBinding;
 use crate::compose::DEFAULT_CONNECT_TIMEOUT;
 use crate::endpoint::{Endpoint, EndpointForm};
 use crate::reference::BootReference;
-use crate::verdict::{TrustworthyVerdict, Verdict};
+use crate::verdict::{Disposition, Outcome, TrustworthyVerdict, Verdict};
 use crate::verify::LicensedVersion;
 
 /// How long the TLS handshake may take once the socket is open.
@@ -102,9 +102,11 @@ pub struct ConnectRequest<'a> {
     pub compose_document: Vec<u8>,
     /// An OS image reference, when the caller has captured one.
     ///
-    /// `None` leaves the boot-measurement check *skipped*, which is legitimate and does not sink
-    /// the verdict — most callers have no reference. Contrast the certificate, whose absence is not
-    /// legitimate for a verdict about an endpoint.
+    /// `None` records the boot-measurement check as `Indeterminate` rather than sinking the
+    /// verdict — `BootMeasurements` is advisory, so its absence does not by itself make the verdict
+    /// untrustworthy, but it is no longer silent about a remedy existing: supply a reference and
+    /// verify again. Contrast the certificate, whose absence is not legitimate for a verdict about
+    /// an endpoint at all.
     pub boot: Option<&'a BootReference>,
     /// Which Intel TCB statuses to accept.
     pub tcb: &'a TcbPolicy,
@@ -643,18 +645,20 @@ impl Refusal {
     /// All three kinds are refusals; none licenses proceeding. [`Refusal::verdict`] is
     /// authoritative whenever it is `Some`.
     ///
-    /// In particular [`Refusal::NotTrustworthy`] maps to [`RefusalKind::GuaranteeViolated`] because
-    /// *some* essential check refused — but the reason may be a platform TCB advisory
-    /// ([`crate::attest::AttestError`] keeps "genuine but out of date" distinguishable from "not
-    /// genuine" precisely so that is visible), or a compose document that arrived truncated.
-    /// Neither is an attack. **Read the verdict before raising an incident.**
+    /// [`Refusal::NotTrustworthy`] refines further, using the verdict it carries: it is
+    /// [`RefusalKind::GuaranteeViolated`] whenever an essential check never ran or reached a
+    /// refusal — a platform TCB advisory ([`crate::attest::AttestError`] keeps "genuine but out of
+    /// date" distinguishable from "not genuine" precisely so this is visible), a compose document
+    /// that arrived truncated, or a check that silently stopped running are all still triaged as
+    /// "read the verdict, this is not necessarily an attack, but it is not a mere outage either" —
+    /// and [`RefusalKind::CouldNotEstablish`] only when every non-passing essential is
+    /// [`Outcome::Indeterminate`], i.e. every one of them names a remedy rather than a refusal.
+    /// **Read the verdict before raising an incident** either way.
     ///
-    /// MA-6's `disposition()` is what will make this per-check. When it lands, this mapping should
-    /// be derived from the verdict's dispositions rather than fixed here, and [`RefusalKind`]
-    /// should map onto its vocabulary. Both are additive, and `#[non_exhaustive]` keeps them minor
-    /// versions.
+    /// This is no longer `const fn`: `Verdict::unrun_essentials`/`missing_essentials` allocate.
+    /// Every existing call site uses the return value, not the constness, so nothing breaks.
     #[must_use]
-    pub const fn kind(&self) -> RefusalKind {
+    pub fn kind(&self) -> RefusalKind {
         // Matched exhaustively and **without a wildcard**, deliberately. `Refusal` is
         // `#[non_exhaustive]`, but that only binds other crates — inside this one a new variant
         // makes this a compile error, which forces whoever adds it to choose a kind rather than
@@ -667,8 +671,53 @@ impl Refusal {
             Self::HandshakeFailed { .. }
             | Self::NoPeerCertificate
             | Self::NoAttestation
+            | Self::UnreadableAttestation { .. } => RefusalKind::GuaranteeViolated,
+            Self::NotTrustworthy { verdict } => {
+                // A check that never ran at all is the regression `unrun_essentials` exists to
+                // surface, and stays `GuaranteeViolated` even though an empty verdict superficially
+                // resembles "nothing was established" the same way `Indeterminate` does —
+                // `verified_transport.rs`'s `every_refusal_variant_maps_to_exactly_one_kind` pins
+                // `Verdict::new()` (nothing ran, nothing recorded) to `GuaranteeViolated` for this
+                // reason.
+                let never_ran = !verdict.unrun_essentials().is_empty();
+                // Written in **positive** form deliberately: every missing essential must be
+                // affirmatively `Indeterminate` for this to read as `CouldNotEstablish`. The
+                // negative form — "no missing essential is `Failed` or `Skipped`" — silently
+                // classifies a future `Outcome` variant this match was never taught about as the
+                // *milder* kind, because neither arm matches it. This form fails the other way: an
+                // unrecognised variant does not match the `Indeterminate` arm either, `all` becomes
+                // `false`, and the result is the stricter `GuaranteeViolated`.
+                let only_indeterminate = verdict
+                    .missing_essentials()
+                    .iter()
+                    .all(|c| matches!(verdict.outcome(*c), Some(Outcome::Indeterminate { .. })));
+                if !never_ran && only_indeterminate {
+                    RefusalKind::CouldNotEstablish
+                } else {
+                    RefusalKind::GuaranteeViolated
+                }
+            }
+        }
+    }
+
+    /// What to do about this refusal. Coarse, like [`Refusal::kind`] — read
+    /// [`Verdict::dispositions`] for the per-check remedies whenever [`Refusal::verdict`] is
+    /// `Some`.
+    ///
+    /// **Not** a fold over the verdict's dispositions, for the reason [`crate::verdict::disposition`]
+    /// rejects an aggregate: this answers "should the caller retry the whole connection", a coarser
+    /// question than any one check's remedy.
+    #[must_use]
+    pub const fn disposition(&self) -> Disposition {
+        // Matched exhaustively and without a wildcard, for the same reason `kind` is.
+        match self {
+            Self::NotReached { .. } | Self::CollateralUnavailable(_) => Disposition::RetryRetrieval,
+            Self::TerminatingEndpoint { .. }
+            | Self::HandshakeFailed { .. }
+            | Self::NoPeerCertificate
+            | Self::NoAttestation
             | Self::UnreadableAttestation { .. }
-            | Self::NotTrustworthy { .. } => RefusalKind::GuaranteeViolated,
+            | Self::NotTrustworthy { .. } => Disposition::Refuse,
         }
     }
 

@@ -2,12 +2,16 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+use verity_verifier::attest::{Collateral, TcbPolicy};
+use verity_verifier::binding::ComposeHash;
+use verity_verifier::channel::PeerCertificate;
 use verity_verifier::quote::Quote;
 use verity_verifier::reference::{
     meets_minimum_version, os_image_by_hash, BootError, BootReference, KNOWN_OS_IMAGES,
     REFERENCE_DATA_DATE,
 };
-use verity_verifier::verdict::{Check, Outcome, Verdict};
+use verity_verifier::verdict::{Check, Disposition, Outcome, Unestablished, Verdict};
+use verity_verifier::verify::{verify, Evidence, LicensedVersion};
 
 const QUOTE_HEX: &str = include_str!("fixtures/quote-v4-dstack-0.5.7.hex");
 
@@ -137,6 +141,85 @@ fn essentials_are_the_checks_without_which_a_verdict_is_meaningless() {
         );
     }
     assert!(!essential.contains(&Check::BootMeasurements));
+}
+
+// — MA-6: T-9, driven through `verify()` rather than constructed by hand —
+//
+// `verdict_semantics.rs`'s boot-reference tests build the outcome directly and never call
+// `verify()`, so nothing exercised the conversion at `verify.rs:201-204` before this. Reverting that
+// site back to `Outcome::Skipped` turns this test red; the hand-built tests above stay green either
+// way, which is exactly the hole this test exists to close.
+
+const T9_COMPOSE: &[u8] = include_bytes!("fixtures/app-compose-0.5.7.json");
+const T9_QUOTE_HEX: &str = include_str!("fixtures/quote-v4-dstack-0.5.7.hex");
+const T9_LICENSED_HASH: &str = "64690ef38b54187da11a41a54905f5f539e948a0414ceb312c8036c82f6529fd";
+const T9_LICENSED_IMAGE: &str =
+    "sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc";
+
+fn t9_quote_bytes() -> Vec<u8> {
+    let hex = T9_QUOTE_HEX.trim();
+    (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("fixture is hex"))
+        .collect()
+}
+
+fn t9_collateral() -> Collateral {
+    Collateral {
+        pck_crl_issuer_chain: String::new(),
+        root_ca_crl: Vec::new(),
+        pck_crl: Vec::new(),
+        tcb_info_issuer_chain: String::new(),
+        tcb_info: "{}".to_owned(),
+        tcb_info_signature: Vec::new(),
+        qe_identity_issuer_chain: String::new(),
+        qe_identity: "{}".to_owned(),
+        qe_identity_signature: Vec::new(),
+        pck_certificate_chain: None,
+    }
+}
+
+/// T-9: `verify()` called with `boot: None` records `BootMeasurements` as `Indeterminate {
+/// ReferenceUnavailable }`, dispositioning to `UpdateReference` — and the verdict is still
+/// trustworthy, because `BootMeasurements` is not promoted to essential by this change.
+#[test]
+fn verify_with_no_boot_reference_records_indeterminate_reference_unavailable() {
+    let licensed = LicensedVersion {
+        compose_hash: ComposeHash::parse_hex(T9_LICENSED_HASH).expect("hash"),
+        image_digest: T9_LICENSED_IMAGE.to_owned(),
+    };
+    let collateral = t9_collateral();
+    let quote = t9_quote_bytes();
+
+    let verdict = verify(
+        &licensed,
+        &Evidence {
+            raw_quote: &quote,
+            compose_document: T9_COMPOSE.to_vec(),
+            collateral: &collateral,
+            now_secs: 1_800_000_000,
+            peer_certificate: PeerCertificate::NotConnected,
+        },
+        None,
+        &TcbPolicy::default(),
+    );
+
+    match verdict.outcome(Check::BootMeasurements) {
+        Some(Outcome::Indeterminate { cause, detail }) => {
+            assert_eq!(*cause, Unestablished::ReferenceUnavailable);
+            assert_eq!(detail, "no OS image reference supplied");
+        }
+        other => panic!("expected Indeterminate, got {other:?}"),
+    }
+    assert_eq!(
+        verdict.disposition(Check::BootMeasurements),
+        Some(Disposition::UpdateReference)
+    );
+    assert!(
+        !verdict
+            .missing_essentials()
+            .contains(&Check::BootMeasurements),
+        "BootMeasurements is not essential; this change does not promote it"
+    );
 }
 
 #[test]

@@ -98,6 +98,12 @@ impl Check {
     /// Without it in this list, every other check can be satisfied by a genuine quote recorded from
     /// a CVM that has since been destroyed, presented beside an endpoint an attacker controls. That
     /// is review finding CR-1, and this line is where it is refused.
+    ///
+    /// **This is also why `ChannelBound` never becomes [`Outcome::Indeterminate`].** MA-6 adds a
+    /// remedy-bearing outcome for "a named action would let this same call conclude" — but no such
+    /// action exists for `ChannelBound` on a call with no connection: the paragraph above already
+    /// says its absence is never legitimate for a verdict about an endpoint, so it stays `Skipped`,
+    /// cited here as the one exception to the rule at [`crate::verify`]'s module doc.
     #[must_use]
     pub const fn essential() -> &'static [Self] {
         &[
@@ -110,12 +116,71 @@ impl Check {
             Self::ChannelBound,
         ]
     }
+
+    /// Every check this verifier can perform, in a stable order.
+    ///
+    /// Hand-maintained rather than derived — `Check` is `#[non_exhaustive]`, so a downstream caller
+    /// genuinely cannot enumerate it any other way, and Rust has no dependency-free way to do this
+    /// for them. Staleness here weakens *test coverage* (a new variant untested by anything that
+    /// loops over `ALL`), never the crate's own correctness: [`disposition`]'s private `Weight`
+    /// match has no wildcard, so a new variant is a compile error there regardless of whether this
+    /// list was updated.
+    ///
+    /// **Do not refactor `tests/verdict_semantics.rs`'s hand-enumerated check names onto this.**
+    /// That test's whole point is that a rename has to confront string literals; looping over `ALL`
+    /// and calling [`Check::name`] would assert `name() == name()`.
+    pub const ALL: &'static [Self] = &[
+        Self::ComposeHash,
+        Self::ImagesPinned,
+        Self::LicensedImagePresent,
+        Self::QuoteSignature,
+        Self::TcbStatus,
+        Self::MrConfigId,
+        Self::BootMeasurements,
+        Self::ChannelBound,
+    ];
 }
 
 impl fmt::Display for Check {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// Why a check could not be established, as a class the caller can act on.
+///
+/// The remedy in typed form. The `detail` string beside it on [`Outcome::Indeterminate`] is for
+/// humans; **this** is what [`disposition`] reads, so a caller never has to parse prose to decide
+/// what to do.
+///
+/// # The rule that decides which cause applies, and when a check is `Indeterminate` at all
+///
+/// A check is `Indeterminate` when it did not conclude, and a named action available to whoever
+/// operates the caller would let **this same call** conclude it on a later attempt: retrieve the
+/// document again, supply a reference, or run a verifier version that supports this construction.
+/// Contrast [`Outcome::Skipped`], which is what remains once no such action applies to *this*
+/// verdict — moot because a prior check already refused, or this construction structurally cannot
+/// perform it, or (the one cited exception, [`Check::essential`]'s doc on `ChannelBound`) the
+/// caller declined for a reason with no remedy in this verdict at all.
+///
+/// "This same call" is load-bearing rather than a version/build-target guess: it is what keeps a
+/// browser binding's collateral-less checks `Skipped` (no later call of that function, with no
+/// collateral parameter, concludes them — reaching the Rust API is a *different* call) while
+/// keeping a missing boot reference or an unsupported `MR-CONFIG-ID` construction `Indeterminate`
+/// (the same function, given the missing input or an updated build, does conclude).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Unestablished {
+    /// Evidence could not be retrieved. A later attempt, possibly from another source, may
+    /// succeed.
+    RetrievalFailed,
+    /// No reference was available to compare against.
+    ReferenceUnavailable,
+    /// This build cannot judge it — a recognised construction, format, or signature this verifier
+    /// does not yet handle. A build that can exists or can be made; running it is the action
+    /// available here. Not "an unrecognised input could not be accounted for" — that has no remedy
+    /// to name and stays [`Outcome::Failed`].
+    VerifierCannotJudge,
 }
 
 /// What a single check concluded.
@@ -125,21 +190,71 @@ pub enum Outcome {
     /// Performed, and passed.
     Passed,
     /// Performed, and failed. The string says how.
+    ///
+    /// **Reached a refusal** — same inputs, same refusal. This is the discriminator against
+    /// [`Outcome::Indeterminate`]: nothing about a later attempt of this call would change the
+    /// answer.
     Failed(String),
-    /// Not performed, and why not.
+    /// Not performed, and there is nothing to tell the caller to do about it.
+    ///
+    /// A prior check already refused and made this one moot, or this construction structurally
+    /// cannot perform it, or (one cited exception: `ChannelBound`, see [`Check::essential`]'s doc)
+    /// the caller declined for a reason no remedy in this verdict addresses. Distinct from
+    /// [`Outcome::Indeterminate`], which names a remedy — `Skipped` is what remains once none
+    /// applies to *this* verdict.
     ///
     /// Skipping is visible rather than silent: a check nobody ran is not a check that passed.
     Skipped(String),
+    /// Attempted, and could not conclude.
+    ///
+    /// Distinct from both [`Outcome::Failed`] (a refusal — same inputs, same answer) and
+    /// [`Outcome::Skipped`] (nothing to do). A named action available to whoever operates the
+    /// caller — see [`Unestablished`] — would let this same call conclude on a later attempt.
+    ///
+    /// **This changes what the caller does about a refusal, never whether they may proceed.**
+    /// Proceeding is governed by [`TrustworthyVerdict`] and nothing else; `Indeterminate` on an
+    /// essential check makes a verdict untrustworthy exactly as `Failed` or `Skipped` would, by
+    /// construction — a property that was not established is a property this verdict cannot claim.
+    Indeterminate {
+        /// The remedy class, in typed form — what [`disposition`] reads. Match this, never the
+        /// detail string.
+        cause: Unestablished,
+        /// For humans. A caller matching on this string's content is the failure this outcome
+        /// exists to prevent — branch on `cause` instead.
+        detail: String,
+    },
 }
 
 impl Outcome {
+    /// Attempted, and could not conclude. See [`Outcome::Indeterminate`] and [`Unestablished`].
+    #[must_use]
+    pub fn unestablished(cause: Unestablished, detail: impl Into<String>) -> Self {
+        Self::Indeterminate {
+            cause,
+            detail: detail.into(),
+        }
+    }
+
+    /// The remedy class, when this outcome is [`Outcome::Indeterminate`]. `None` otherwise.
+    #[must_use]
+    pub const fn cause(&self) -> Option<Unestablished> {
+        match self {
+            Self::Indeterminate { cause, .. } => Some(*cause),
+            Self::Passed | Self::Failed(_) | Self::Skipped(_) => None,
+        }
+    }
+
     /// Whether this outcome is a pass.
+    ///
+    /// **`Indeterminate` is not a pass** — deliberately, and this is where that is decided: `matches!`
+    /// answers `false` for every variant but `Passed`, so a check that could not conclude never
+    /// reads as having concluded successfully. `tests/verdict_semantics.rs` pins it.
     #[must_use]
     pub const fn passed(&self) -> bool {
         matches!(self, Self::Passed)
     }
 
-    /// The one-word transcript label: `passed`, `skipped` or `FAILED`.
+    /// The one-word transcript label: `passed`, `skipped`, `FAILED` or `indeterminate`.
     ///
     /// **This is a shell contract, not a display preference.**
     /// `verity-foundation/closed-loop/04-refuses-on-mismatch.sh` and
@@ -147,8 +262,9 @@ impl Outcome {
     /// the only end-to-end gates over this crate, and until this function existed the words lived in
     /// an example binary where no test could reach them.
     ///
-    /// `FAILED` is shouted and the other two are not, because a human skimming a transcript should
-    /// see a refusal without reading.
+    /// `FAILED` is shouted and the others are not. `indeterminate` is lower case *deliberately*: it
+    /// usually means an outage, and shouting it would train an operator to read infrastructure
+    /// faults as attacks — the sensitisation this outcome exists to prevent.
     ///
     /// Matched exhaustively and **without a wildcard**, deliberately. `Outcome` is
     /// `#[non_exhaustive]`, but that only binds other crates — inside this one a new variant makes
@@ -161,6 +277,143 @@ impl Outcome {
             Self::Passed => "passed",
             Self::Skipped(_) => "skipped",
             Self::Failed(_) => "FAILED",
+            Self::Indeterminate { .. } => "indeterminate",
+        }
+    }
+}
+
+/// What a caller should do about one check.
+///
+/// **This is advice about a check, never permission to proceed.** Whether an endpoint may be used
+/// is answered by [`TrustworthyVerdict`] and by nothing else — including this. A `RetryRetrieval`
+/// on an essential check means "retry, and until it succeeds you still have no verdict".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Disposition {
+    /// The check ran and passed. Nothing to do.
+    Satisfied,
+    /// Refuse. Retrying cannot change it and no remedy applies.
+    ///
+    /// **Can appear on a verdict that is still trustworthy.** `(BootMeasurements, Failed)` still
+    /// dispositions to `Refuse` — `BootMeasurements` is advisory, so the mismatch does not sink
+    /// `is_trustworthy()`, but a measured discrepancy is a refusal whatever else passed. This is
+    /// deliberate asymmetry, not a bug: dispositions never override [`TrustworthyVerdict`] and never
+    /// substitute for it. Read the trust boolean for "may I proceed" and dispositions for "what do I
+    /// do about a refusal I already have" — folding a `Refuse` here into "therefore do not proceed"
+    /// reintroduces the single actionable value this type deliberately does not offer (see
+    /// [`disposition`]'s rejection of an aggregate).
+    Refuse,
+    /// Evidence could not be retrieved. Try again, or try another source.
+    RetryRetrieval,
+    /// This build cannot judge it. Use one that can.
+    UpdateVerifier,
+    /// No reference was available to compare against. Obtain one.
+    UpdateReference,
+    /// Not established, and the verdict does not depend on it.
+    ProceedNonEssential,
+}
+
+impl Disposition {
+    /// A stable identifier, for telemetry and the JavaScript surface.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Satisfied => "satisfied",
+            Self::Refuse => "refuse",
+            Self::RetryRetrieval => "retry_retrieval",
+            Self::UpdateVerifier => "update_verifier",
+            Self::UpdateReference => "update_reference",
+            Self::ProceedNonEssential => "proceed_non_essential",
+        }
+    }
+}
+
+impl fmt::Display for Disposition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// How much a check's outcome matters to the verdict.
+///
+/// Private: this is the *only* thing [`disposition`] needs from a [`Check`], and exposing it would
+/// create a second public spelling of [`Check::essential`] — two definitions of "essential" that
+/// can drift apart, which is the defect [`TrustworthyVerdict::check`] avoids by calling
+/// [`Verdict::is_trustworthy`] rather than re-implementing it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Weight {
+    Essential,
+    Advisory,
+}
+
+/// Deliberately **not** derived from `Check::essential().contains(check)`: a `contains` lookup
+/// would silently classify a *new* `Check` variant as advisory, the fail-open default. Matched
+/// exhaustively and without a wildcard instead, for the same reason [`Outcome::label`] is — a new
+/// variant is a compile error here, forcing whoever adds it to choose. `tests/verdict_semantics.rs`
+/// asserts this agrees with [`Check::essential`] for every check, so the duplication cannot drift
+/// unnoticed.
+const fn weight(check: Check) -> Weight {
+    match check {
+        Check::ComposeHash
+        | Check::ImagesPinned
+        | Check::LicensedImagePresent
+        | Check::QuoteSignature
+        | Check::TcbStatus
+        | Check::MrConfigId
+        | Check::ChannelBound => Weight::Essential,
+        Check::BootMeasurements => Weight::Advisory,
+    }
+}
+
+/// What to do about one check's outcome.
+///
+/// A property of the *pair*, like [`transcript_line`]: the same [`Outcome`] means something
+/// different on an essential check than on an advisory one — `(BootMeasurements, Skipped)` is
+/// `ProceedNonEssential`, but the identical outcome on any other check is `Refuse` — so neither
+/// [`Check`] nor [`Outcome`] alone can answer it. Free rather than a method on either type, for the
+/// same reason.
+///
+/// The mapping is exhaustive and total over every `(Check, Outcome)` shape; `tests/verdict_semantics.rs`
+/// asserts every cell against a literal, not a re-derivation, so a change to the mapping has to
+/// change the test too rather than pass silently.
+///
+/// **Rejected: a single aggregate over a whole verdict.** Remedies are a set, not a lattice — a
+/// verdict can need a verifier update *and* a retrieval retry, and folding them into one value picks
+/// one and hides the other. A single actionable value on `Verdict` is also one rename away from
+/// becoming the thing callers branch on instead of [`TrustworthyVerdict`], reintroducing the
+/// ignorable verdict that type exists to close.
+#[must_use]
+pub fn disposition(check: Check, outcome: &Outcome) -> Disposition {
+    match outcome {
+        Outcome::Passed => Disposition::Satisfied,
+        Outcome::Failed(_) => Disposition::Refuse,
+        Outcome::Skipped(_) => match weight(check) {
+            Weight::Essential => Disposition::Refuse,
+            Weight::Advisory => Disposition::ProceedNonEssential,
+        },
+        Outcome::Indeterminate { cause, .. } => match cause {
+            Unestablished::RetrievalFailed => Disposition::RetryRetrieval,
+            Unestablished::ReferenceUnavailable => Disposition::UpdateReference,
+            Unestablished::VerifierCannotJudge => Disposition::UpdateVerifier,
+        },
+    }
+}
+
+impl Unestablished {
+    /// The remedy this cause calls for, independent of any check.
+    ///
+    /// Lets a caller whose retrieval failed report a refusal **with a typed disposition** and no
+    /// verdict at all — the shape [`crate::connect::Refusal`] already uses for
+    /// [`crate::connect::CollateralUnavailable`]. Defined here, in the ungated `verdict` module
+    /// rather than beside `verify`, so a `default-features = false` embedder building for `wasm32`
+    /// — the embedder most likely to be hand-implementing [`crate::compose::Source`] — can reach it
+    /// without the `attest` feature that gates `verify`.
+    #[must_use]
+    pub const fn disposition(self) -> Disposition {
+        match self {
+            Self::RetrievalFailed => Disposition::RetryRetrieval,
+            Self::ReferenceUnavailable => Disposition::UpdateReference,
+            Self::VerifierCannotJudge => Disposition::UpdateVerifier,
         }
     }
 }
@@ -205,7 +458,11 @@ pub fn transcript_line(check: Check, outcome: &Outcome) -> String {
     // collapse this crate refuses everywhere else, and the one F-09's alert is built on.
     let rendered = match outcome {
         Outcome::Passed => label.to_owned(),
-        Outcome::Failed(why) | Outcome::Skipped(why) => format!("{label} ({why})"),
+        Outcome::Failed(why)
+        | Outcome::Skipped(why)
+        | Outcome::Indeterminate { detail: why, .. } => {
+            format!("{label} ({why})")
+        }
     };
     // The literal space after `{:<22}` is what guarantees the scripts' `+` always has something to
     // match, including for `licensed_image_present`, which is exactly 22 characters and so consumes
@@ -268,13 +525,19 @@ impl Verdict {
     }
 
     /// Checks that failed.
+    ///
+    /// **Deliberately excludes `Indeterminate`.** A check that could not conclude did not reach a
+    /// refusal, so listing it here would report something that did not happen. That is the correct
+    /// reading, but it is not the one the wildcard below enforces — a new variant would fall into
+    /// it silently, so `tests/verdict_semantics.rs` pins this behaviour with a test written from the
+    /// failure: adding an arm for `Indeterminate` here and watching the assertion go red.
     #[must_use]
     pub fn failures(&self) -> Vec<(Check, &str)> {
         self.results
             .iter()
             .filter_map(|(c, o)| match o {
                 Outcome::Failed(why) => Some((*c, why.as_str())),
-                _ => None,
+                Outcome::Passed | Outcome::Skipped(_) | Outcome::Indeterminate { .. } => None,
             })
             .collect()
     }
@@ -316,6 +579,26 @@ impl Verdict {
     #[must_use]
     pub fn is_trustworthy(&self) -> bool {
         self.missing_essentials().is_empty()
+    }
+
+    /// What to do about one check. `None` when it was never recorded.
+    #[must_use]
+    pub fn disposition(&self, check: Check) -> Option<Disposition> {
+        self.outcome(check)
+            .map(|outcome| disposition(check, outcome))
+    }
+
+    /// Every check and what to do about it, in the order performed.
+    ///
+    /// Deliberately not folded into one aggregate value: remedies are a *set*, not a lattice — a
+    /// verdict can need a verifier update **and** a retrieval retry, and collapsing them would hide
+    /// one. See [`disposition`]'s rejection of `Verdict::overall_disposition`.
+    #[must_use]
+    pub fn dispositions(&self) -> Vec<(Check, Disposition)> {
+        self.results
+            .iter()
+            .map(|(c, o)| (*c, disposition(*c, o)))
+            .collect()
     }
 }
 
@@ -420,11 +703,19 @@ impl fmt::Display for Verdict {
             "verity-verifier {} (reference data {})",
             self.verifier_version, self.reference_data_date
         )?;
+        // 14-column label field, widened from 8 to fit `indeterminate` (13 characters) with at
+        // least one space of separation — the same guarantee `transcript_line`'s `{:<22}` makes for
+        // check names. A shorter word just for `Display` would put a fifth spelling into a
+        // vocabulary this change exists to reduce to four, at the one surface a human reads during
+        // a refusal.
         for (check, outcome) in &self.results {
             match outcome {
-                Outcome::Passed => writeln!(f, "  pass    {check}")?,
-                Outcome::Failed(why) => writeln!(f, "  FAIL    {check}: {why}")?,
-                Outcome::Skipped(why) => writeln!(f, "  skipped {check}: {why}")?,
+                Outcome::Passed => writeln!(f, "  {:<14}{check}", "pass")?,
+                Outcome::Failed(why) => writeln!(f, "  {:<14}{check}: {why}", "FAIL")?,
+                Outcome::Skipped(why) => writeln!(f, "  {:<14}{check}: {why}", "skipped")?,
+                Outcome::Indeterminate { detail, .. } => {
+                    writeln!(f, "  {:<14}{check}: {detail}", "indeterminate")?;
+                }
             }
         }
         let missing = self.missing_essentials();

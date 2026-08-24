@@ -28,7 +28,7 @@ use verity_verifier::attest::{Collateral, TcbPolicy};
 use verity_verifier::binding::ComposeHash;
 use verity_verifier::channel::{ChannelBindError, ChannelBinding, PeerCertificate};
 use verity_verifier::quote::Quote;
-use verity_verifier::verdict::{Check, Outcome};
+use verity_verifier::verdict::{Check, Disposition, Outcome};
 use verity_verifier::verify::{verify, Evidence, LicensedVersion};
 
 // — the matched pair, CVM 9be9f370, dstack-0.5.9, captured 2026-08-09 —
@@ -324,6 +324,15 @@ fn a_verdict_without_a_connection_is_not_trustworthy_and_says_so() {
         &TcbPolicy::default(),
     );
 
+    // T-14 (MA-6). **Not a general guard on this `verify()` call** — `boot: None` above traverses
+    // MA-6's own boot-reference conversion site too, but nothing here asserts on `BootMeasurements`,
+    // so this test alone would not have caught that conversion breaking. It guards one thing only:
+    // that `ChannelBound` on `NotConnected` is *not* swept into `Indeterminate` along with it. **Name
+    // the shape of the weakening this forbids**, because "do not weaken this" is satisfied the wrong
+    // way by a reader who keeps the three assertions passing while destroying what they check: the
+    // weakening is replacing `Some(Outcome::Skipped(why))` below with a wildcard that extracts a
+    // detail string from *any* variant — which keeps "considered", "did not pass" and "did not
+    // vanish" all green while admitting `Indeterminate` right through the arm meant to exclude it.
     match verdict.outcome(Check::ChannelBound) {
         Some(Outcome::Skipped(why)) => assert!(
             why.contains("no connection was made"),
@@ -337,6 +346,11 @@ fn a_verdict_without_a_connection_is_not_trustworthy_and_says_so() {
         "a declared skip is not a check that vanished"
     );
     assert!(!verdict.is_trustworthy());
+    assert_eq!(
+        verdict.disposition(Check::ChannelBound),
+        Some(Disposition::Refuse),
+        "ChannelBound is essential, so a decline still dispositions to Refuse"
+    );
 }
 
 /// **Acceptance criterion 3, and the property `06` proves end to end.**

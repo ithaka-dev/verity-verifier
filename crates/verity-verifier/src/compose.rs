@@ -148,6 +148,23 @@ pub enum FetchError {
     },
 }
 
+impl From<&FetchError> for crate::verdict::Unestablished {
+    /// Every retrieval failure is a remedy the caller can retry: fetch again, or from another
+    /// source. `TooLarge` is arguably hostile rather than an outage, but the caller's action is
+    /// identical and a verdict cannot tell the two apart, so it is not given a cause of its own.
+    ///
+    /// Matched exhaustively and without a wildcard, so a future `FetchError` variant is a compile
+    /// error here rather than silently inheriting a default.
+    fn from(err: &FetchError) -> Self {
+        match err {
+            FetchError::Transport { .. }
+            | FetchError::Status { .. }
+            | FetchError::TooLarge { .. }
+            | FetchError::Unsupported { .. } => Self::RetrievalFailed,
+        }
+    }
+}
+
 /// Somewhere a compose document can be retrieved from.
 ///
 /// Implement this to plug in a local blockstore, a bundled copy, or any other retrieval path.

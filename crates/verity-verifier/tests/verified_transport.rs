@@ -52,7 +52,7 @@ use verity_verifier::connect::{
 };
 use verity_verifier::endpoint::Endpoint;
 use verity_verifier::ratls::extension_value_for_quote;
-use verity_verifier::verdict::{Check, Outcome};
+use verity_verifier::verdict::{Check, Disposition, Outcome, Unestablished, Verdict};
 use verity_verifier::verify::LicensedVersion;
 
 const RATLS_LEAF_PEM: &[u8] = include_bytes!("fixtures/ratls-leaf-dstack-0.5.9.pem");
@@ -623,6 +623,95 @@ fn every_refusal_variant_maps_to_exactly_one_kind() {
     // must agree with `name()` rather than being a second, prettier rendering that can drift.
     for (refusal, _) in &cases {
         assert_eq!(refusal.kind().to_string(), refusal.kind().name());
+    }
+}
+
+// — MA-6: `Refusal::disposition()` and the `kind()` refinement —
+
+/// `Refusal::disposition()` is coarse, like `kind()`: only the two retrieval-shaped refusals
+/// disposition to `RetryRetrieval`, and every other variant — including `NotTrustworthy`, whatever
+/// its verdict's own per-check dispositions say — is `Refuse`. Not a fold over the verdict: a
+/// `NotTrustworthy` refusal here always reads `Refuse` even when every non-passing essential inside
+/// it is `Indeterminate`, because this answers "should the caller retry the whole connection", a
+/// coarser question than any one check's remedy — read `Verdict::dispositions` via `Refusal::verdict`
+/// for that.
+#[test]
+fn refusal_disposition_is_retry_only_for_the_two_retrieval_shaped_variants() {
+    let retryable = [
+        Refusal::NotReached {
+            host: "a".to_owned(),
+            port: 443,
+            detail: "refused".to_owned(),
+        },
+        Refusal::CollateralUnavailable(CollateralUnavailable::new("no answer")),
+    ];
+    for refusal in &retryable {
+        assert_eq!(
+            refusal.disposition(),
+            Disposition::RetryRetrieval,
+            "{refusal:?}"
+        );
+    }
+
+    let not_retryable = [
+        Refusal::TerminatingEndpoint {
+            host: "a".to_owned(),
+            passthrough: "b".to_owned(),
+        },
+        Refusal::NoPeerCertificate,
+        Refusal::NotTrustworthy {
+            verdict: Box::new(Verdict::new().record(
+                Check::MrConfigId,
+                Outcome::unestablished(Unestablished::VerifierCannotJudge, "V2"),
+            )),
+        },
+    ];
+    for refusal in &not_retryable {
+        assert_eq!(refusal.disposition(), Disposition::Refuse, "{refusal:?}");
+    }
+}
+
+/// `kind()`'s refinement: a `NotTrustworthy` verdict whose only non-passing essentials are
+/// `Indeterminate` is `CouldNotEstablish`, not `GuaranteeViolated` — nothing was violated, only
+/// unestablished.
+#[test]
+fn kind_reports_could_not_establish_when_every_non_passing_essential_is_indeterminate() {
+    let mut verdict = Verdict::new();
+    for check in Check::essential() {
+        let outcome = if *check == Check::MrConfigId {
+            Outcome::unestablished(Unestablished::VerifierCannotJudge, "V2")
+        } else {
+            Outcome::Passed
+        };
+        verdict = verdict.record(*check, outcome);
+    }
+    let refusal = Refusal::NotTrustworthy {
+        verdict: Box::new(verdict),
+    };
+    assert_eq!(refusal.kind(), RefusalKind::CouldNotEstablish);
+}
+
+/// The same shape, but one essential reached a refusal instead of merely being unestablished — this
+/// must stay `GuaranteeViolated`, because *something* was violated, not only unestablished.
+#[test]
+fn kind_stays_guarantee_violated_when_any_non_passing_essential_is_failed_or_skipped() {
+    for bad in [
+        Outcome::Failed("mismatch".to_owned()),
+        Outcome::Skipped("declined".to_owned()),
+    ] {
+        let mut verdict = Verdict::new();
+        for check in Check::essential() {
+            let outcome = if *check == Check::MrConfigId {
+                bad.clone()
+            } else {
+                Outcome::Passed
+            };
+            verdict = verdict.record(*check, outcome);
+        }
+        let refusal = Refusal::NotTrustworthy {
+            verdict: Box::new(verdict),
+        };
+        assert_eq!(refusal.kind(), RefusalKind::GuaranteeViolated, "{bad:?}");
     }
 }
 

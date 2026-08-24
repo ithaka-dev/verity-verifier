@@ -63,6 +63,13 @@ struct JsCheck {
     check: String,
     outcome: &'static str,
     detail: Option<String>,
+    /// A typed instruction: what to do about this outcome. See
+    /// [`verity_verifier::verdict::Disposition::name`] for the closed set of values — a caller
+    /// should match this, never parse `detail`. The remedy class (`Unestablished`) that produces an
+    /// `"indeterminate"` outcome is deliberately **not** exposed as its own field: the three causes
+    /// map onto three distinct dispositions one-to-one, so a second field would be a second
+    /// spelling of the same fact.
+    disposition: &'static str,
 }
 
 /// A verdict, as seen from JavaScript.
@@ -99,13 +106,16 @@ fn to_js(verdict: &verity_verifier::verdict::Verdict) -> JsVerdict {
                     Outcome::Passed => "passed",
                     Outcome::Failed(_) => "failed",
                     Outcome::Skipped(_) => "skipped",
+                    Outcome::Indeterminate { .. } => "indeterminate",
                     _ => "unknown",
                 },
                 detail: match outcome {
                     Outcome::Passed => None,
                     Outcome::Failed(d) | Outcome::Skipped(d) => Some(d.clone()),
+                    Outcome::Indeterminate { detail, .. } => Some(detail.clone()),
                     _ => Some("outcome variant unknown to these bindings; upgrade them".to_owned()),
                 },
+                disposition: verity_verifier::verdict::disposition(*check, outcome).name(),
             })
             .collect(),
         is_trustworthy: verdict.is_trustworthy(),
@@ -323,6 +333,21 @@ fn compose_only_verdict(
         Ok(quote) => {
             match verity_verifier::binding::check_mrconfigid(quote.mrconfigid(), &licensed) {
                 Ok(()) => verdict = verdict.record(Check::MrConfigId, Outcome::Passed),
+                // Recognised, but this build cannot yet compute a reference for it: the same
+                // remedy as the core's `mrconfigid_outcome` (`verify.rs`) — an updated build
+                // judges the same call — so this site needs the identical split or the two
+                // surfaces disagree about the same input. `UnknownVersion` (including all-zero,
+                // what an unpopulated field looks like) and `Mismatch` have no such remedy and
+                // stay `Failed`.
+                Err(e @ verity_verifier::binding::MrConfigIdError::UnsupportedVersion { .. }) => {
+                    verdict = verdict.record(
+                        Check::MrConfigId,
+                        Outcome::unestablished(
+                            verity_verifier::verdict::Unestablished::VerifierCannotJudge,
+                            e.to_string(),
+                        ),
+                    );
+                }
                 Err(e) => {
                     verdict = verdict.record(Check::MrConfigId, Outcome::Failed(e.to_string()));
                 }
@@ -403,7 +428,7 @@ mod tests {
     )]
 
     use super::{compose_only_verdict, compose_only_verdict_from_js_args, to_js};
-    use verity_verifier::verdict::{Check, Outcome, Verdict};
+    use verity_verifier::verdict::{Check, Outcome, Unestablished, Verdict};
 
     const COMPOSE: &[u8] =
         include_bytes!("../../verity-verifier/tests/fixtures/app-compose-0.5.7.json");
@@ -471,6 +496,36 @@ mod tests {
         assert!(
             !verdict.is_trustworthy(),
             "everything checkable passed, and that is still not verification"
+        );
+    }
+
+    /// A recognised-but-unsupported `MR-CONFIG-ID` construction (V2) is `Indeterminate`, not
+    /// `Failed`, through the WASM path too — by the same "this same call, on an updated build,
+    /// concludes" rule that gives the core its split (`verify.rs`'s `mrconfigid_outcome`). This
+    /// site is a *second*, independent recording of `MrConfigId` from the same
+    /// `MrConfigIdError` type, so it needs the same split or the two surfaces disagree about the
+    /// same input.
+    #[test]
+    fn mrconfigid_v2_is_indeterminate_through_the_wasm_path_too() {
+        let mut q = quote();
+        // MR-CONFIG-ID sits at 48 + 184 within the quote (`quote.rs`'s `HEADER_LEN` +
+        // `OFF_MRCONFIGID`); only the prefix byte decides which construction
+        // `MrConfigIdVersion::from_measurement` recognises.
+        q[48 + 184] = 0x02;
+        let verdict = compose_only_verdict(COMPOSE, LICENSED, IMAGE, &q, None);
+
+        match outcome_of(&verdict, Check::MrConfigId) {
+            Some(Outcome::Indeterminate { cause, .. }) => {
+                assert_eq!(
+                    *cause,
+                    verity_verifier::verdict::Unestablished::VerifierCannotJudge
+                );
+            }
+            other => panic!("expected Indeterminate, got {other:?}"),
+        }
+        assert!(
+            !verdict.is_trustworthy(),
+            "MrConfigId is essential, so Indeterminate must still sink the verdict"
         );
     }
 
@@ -644,14 +699,18 @@ mod tests {
 
     // — the JavaScript projection —
 
-    /// The mapping into the JavaScript shape must not lose the distinction between the three
+    /// The mapping into the JavaScript shape must not lose the distinction between the four
     /// outcomes, since that shape is all a JavaScript caller ever sees.
     #[test]
-    fn the_js_projection_preserves_pass_fail_and_skip() {
+    fn the_js_projection_preserves_pass_fail_skip_and_indeterminate() {
         let verdict = Verdict::new()
             .record(Check::ComposeHash, Outcome::Passed)
             .record(Check::ImagesPinned, Outcome::Failed("tagged".to_owned()))
-            .record(Check::MrConfigId, Outcome::Skipped("no quote".to_owned()));
+            .record(Check::MrConfigId, Outcome::Skipped("no quote".to_owned()))
+            .record(
+                Check::BootMeasurements,
+                Outcome::unestablished(Unestablished::ReferenceUnavailable, "no reference"),
+            );
         let js = to_js(&verdict);
 
         assert_eq!(js.checks[0].outcome, "passed");
@@ -660,7 +719,64 @@ mod tests {
         assert_eq!(js.checks[1].detail.as_deref(), Some("tagged"));
         assert_eq!(js.checks[2].outcome, "skipped");
         assert_eq!(js.checks[2].detail.as_deref(), Some("no quote"));
+        assert_eq!(js.checks[3].outcome, "indeterminate");
+        assert_eq!(js.checks[3].detail.as_deref(), Some("no reference"));
         assert!(!js.is_trustworthy);
+    }
+
+    /// The typed instruction a JavaScript caller reads instead of parsing `detail`.
+    ///
+    /// T-12: reverting `JsCheck.disposition` back out and re-running this test reproduces
+    /// `error[E0609]` — no field `disposition` on type `JsCheck` — on every line below that reads
+    /// it, the closest a struct-literal-free test gets to "watch it fail first" for a field
+    /// addition. This test builds its `Verdict` by hand rather than through `verify()` or
+    /// `compose_only_verdict()`, so it says nothing about either function's `MrConfigId` arm; that
+    /// path is covered separately by `mrconfigid_v2_is_indeterminate_through_the_wasm_path_too`.
+    #[test]
+    fn the_js_projection_carries_a_typed_disposition() {
+        let verdict = Verdict::new()
+            .record(Check::ComposeHash, Outcome::Passed)
+            .record(Check::ImagesPinned, Outcome::Failed("tagged".to_owned()))
+            .record(Check::MrConfigId, Outcome::Skipped("no quote".to_owned()))
+            .record(
+                Check::BootMeasurements,
+                Outcome::unestablished(Unestablished::ReferenceUnavailable, "no reference"),
+            );
+        let js = to_js(&verdict);
+
+        assert_eq!(js.checks[0].disposition, "satisfied");
+        assert_eq!(js.checks[1].disposition, "refuse");
+        assert_eq!(
+            js.checks[2].disposition, "refuse",
+            "mr_config_id is essential, so a skip still dispositions to refuse"
+        );
+        assert_eq!(js.checks[3].disposition, "update_reference");
+    }
+
+    /// **The drift guard relocated from `verity-verifier/tests/transcript_contract.rs`.**
+    ///
+    /// That test asserted `Outcome::label()` against three hardcoded literals with a *comment*
+    /// describing `to_js` — it would have passed even if `to_js` were deleted, because its crate
+    /// does not depend on this one. This is the version that can actually observe drift: both
+    /// surfaces are in scope here, so a JavaScript rendering that stopped agreeing with the core
+    /// label fails this assertion rather than nothing at all.
+    #[test]
+    fn the_wasm_outcome_string_stays_in_lockstep_with_the_core_label_for_every_outcome() {
+        let cases = [
+            Outcome::Passed,
+            Outcome::Failed("x".to_owned()),
+            Outcome::Skipped("x".to_owned()),
+            Outcome::unestablished(Unestablished::RetrievalFailed, "x"),
+        ];
+        for outcome in cases {
+            let verdict = Verdict::new().record(Check::ComposeHash, outcome.clone());
+            let js = to_js(&verdict);
+            assert_eq!(
+                js.checks[0].outcome,
+                outcome.label().to_lowercase(),
+                "the WASM projection must never drift from the core label for {outcome:?}"
+            );
+        }
     }
 
     /// Check names cross the boundary unchanged: they are the identifiers JavaScript groups and

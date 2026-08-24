@@ -69,8 +69,9 @@ async fn main() -> ExitCode {
     let attestation_path = arg("--attestation").expect("--attestation <file>");
     let compose_path = arg("--compose").expect("--compose <file>");
     let image_digest = arg("--image-digest").expect("--image-digest sha256:…");
-    // Optional. Absent means the boot check is *skipped*, and the verdict says so — which is not
-    // the same as passing, and is why `BootReference` uses `Option` per field rather than defaults.
+    // Optional. Absent means the boot check is *indeterminate* — a remedy exists (supply a
+    // reference and run this again) and the verdict says so — which is not the same as passing, and
+    // is why `BootReference` uses `Option` per field rather than defaults.
     let os_image = arg("--os-image");
     let boot_reference_path = arg("--boot-reference");
     // Optional, and the two are independent. `--endpoint` is provenance the library never sees;
@@ -178,7 +179,8 @@ async fn main() -> ExitCode {
     // — boot measurements, only when a reference was supplied —
     //
     // There is nowhere to get one automatically: nothing bundled holds register values. So this is
-    // caller-supplied JSON, and its absence leaves check 7 skipped rather than silently passing.
+    // caller-supplied JSON, and its absence leaves check 7 indeterminate rather than silently
+    // passing.
     let boot = boot_reference_path.as_deref().map(load_boot_reference);
 
     // Absent means `PeerCertificate::NotConnected`, which is honest and which makes the verdict
@@ -253,12 +255,12 @@ fn report_os_image(name: Option<&str>) -> bool {
 /// Print which comparisons actually ran, not only what they concluded.
 ///
 /// A verifier that quietly stops performing one still reports success; this list is the only place
-/// that shows. The per-check lines are rendered by the **library** rather than here: passed, skipped
-/// and failed are three different things and must render as three — an earlier version of this
-/// example printed anything not-passed as FAILED, reporting a *skipped* boot-measurement check as a
-/// failure. That logic now lives in `transcript_line`, where `tests/transcript_contract.rs` pins the
-/// exact bytes, because two closed-loop gates parse these lines and nothing could reach them while
-/// they were formatted in an example binary.
+/// that shows. The per-check lines are rendered by the **library** rather than here: passed,
+/// skipped, failed and indeterminate are four different things and must render as four — an
+/// earlier version of this example printed anything not-passed as FAILED, reporting a *skipped*
+/// boot-measurement check as a failure. That logic now lives in `transcript_line`, where
+/// `tests/transcript_contract.rs` pins the exact bytes, because two closed-loop gates parse these
+/// lines and nothing could reach them while they were formatted in an example binary.
 fn report_transcript(verdict: &verity_verifier::verdict::Verdict) {
     println!("\nchecks performed:");
     for (check, outcome) in verdict.results() {
@@ -393,7 +395,7 @@ fn warn_if_tls_terminating(endpoint: &str) {
 ///
 /// There is nowhere to get one automatically — nothing bundled holds register values — so this is
 /// JSON the caller captured from a deployment they independently satisfied themselves about. Its
-/// absence leaves check 7 *skipped* rather than silently passing, which is why every field is
+/// absence leaves check 7 *indeterminate* rather than silently passing, which is why every field is
 /// `Option`.
 fn load_boot_reference(path: &str) -> BootReference {
     let raw: serde_json::Value =

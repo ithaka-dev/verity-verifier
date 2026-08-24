@@ -21,7 +21,7 @@ use verity_verifier::binding::ComposeHash;
 use verity_verifier::channel::PeerCertificate;
 use verity_verifier::quote::Quote;
 use verity_verifier::reference::BootReference;
-use verity_verifier::verdict::{Check, Outcome};
+use verity_verifier::verdict::{Check, Disposition, Outcome, Unestablished};
 use verity_verifier::verify::{verify, Evidence, LicensedVersion};
 
 const COMPOSE: &[u8] = include_bytes!("fixtures/app-compose-0.5.7.json");
@@ -193,6 +193,76 @@ fn garbage_quote_fails_signature_and_mrconfigid() {
         v.outcome(Check::MrConfigId),
         Some(Outcome::Failed(_))
     ));
+    assert!(!v.is_trustworthy());
+}
+
+/// T-15: on an unparseable quote, `BootMeasurements` stays `Skipped` — moot, because `MrConfigId`
+/// already refused for the exact same reason — while `ChannelBound` is `Failed` — a refusal in its
+/// own right, since the evidence itself is unusable rather than merely absent. Both in the same
+/// verdict. Nearly free: `garbage_quote_fails_signature_and_mrconfigid` above already reaches this
+/// state and asserted neither outcome before this change.
+#[test]
+fn garbage_quote_leaves_boot_measurements_skipped_and_channel_bound_failed() {
+    let v = run!(vec![0u8; 700], COMPOSE.to_vec(), licensed());
+
+    match v.outcome(Check::BootMeasurements) {
+        Some(Outcome::Skipped(why)) => assert!(
+            why.contains("quote could not be parsed"),
+            "boot_measurements must name why it was skipped, was {why:?}"
+        ),
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    match v.outcome(Check::ChannelBound) {
+        Some(Outcome::Failed(why)) => assert!(
+            why.contains("quote could not be parsed"),
+            "channel_bound must name why it failed, was {why:?}"
+        ),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+// — MR-CONFIG-ID version boundary (§6b) —
+
+/// T-17: a recognised-but-unsupported `MR-CONFIG-ID` construction (V2) is `Indeterminate`, not
+/// `Failed` — this verifier's own limitation, with a named remedy: run a build that supports it.
+#[test]
+fn mrconfigid_v2_is_indeterminate_and_updates_the_verifier() {
+    let mut q = quote_bytes();
+    // MR-CONFIG-ID sits at 48 + 184 within the quote (`quote.rs`'s `HEADER_LEN` +
+    // `OFF_MRCONFIGID`, the same "48 +" convention `rtmr3_drift_is_tolerated` above uses); only
+    // the prefix byte decides which construction `MrConfigIdVersion::from_measurement`
+    // recognises.
+    q[48 + 184] = 0x02;
+    let v = run!(q, COMPOSE.to_vec(), licensed());
+
+    match v.outcome(Check::MrConfigId) {
+        Some(Outcome::Indeterminate { cause, .. }) => {
+            assert_eq!(*cause, Unestablished::VerifierCannotJudge);
+        }
+        other => panic!("expected Indeterminate, got {other:?}"),
+    }
+    assert_eq!(
+        v.disposition(Check::MrConfigId),
+        Some(Disposition::UpdateVerifier)
+    );
+    assert!(!v.is_trustworthy());
+}
+
+/// T-17's boundary: an unrecognised prefix — **including all-zero, what an unpopulated field looks
+/// like** — stays `Failed`, not `Indeterminate`. Drawing this the other way would let evidence
+/// nobody can account for disposition to "update your verifier"; the facilitator asked that this
+/// boundary not move on symmetry grounds with the case above.
+#[test]
+fn mrconfigid_unrecognised_prefix_including_all_zero_stays_failed() {
+    let mut q = quote_bytes();
+    q[48 + 184] = 0x00;
+    let v = run!(q, COMPOSE.to_vec(), licensed());
+
+    assert!(matches!(
+        v.outcome(Check::MrConfigId),
+        Some(Outcome::Failed(_))
+    ));
+    assert_eq!(v.disposition(Check::MrConfigId), Some(Disposition::Refuse));
     assert!(!v.is_trustworthy());
 }
 
