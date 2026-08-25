@@ -4,13 +4,13 @@
 //! this themselves — but the assembled version is what should be used, because it is the one that
 //! cannot forget a step.
 
-use crate::attest::{self, Collateral, TcbPolicy};
+use crate::attest::{self, Collateral};
 use crate::binding::{check_mrconfigid, ComposeHash, MrConfigIdError, VerifiedCompose};
 use crate::channel::{ChannelBinding, PeerCertificate};
 use crate::images;
 use crate::quote::Quote;
 use crate::reference::{check_boot_measurements, BootReference};
-use crate::verdict::{Check, Outcome, Unestablished, Verdict};
+use crate::verdict::{AttestedTcb, Check, Outcome, Unestablished, Verdict};
 
 /// What a licence names, read from an `AppManifest` version record.
 #[derive(Debug, Clone)]
@@ -96,6 +96,61 @@ fn channel_bound(peer: PeerCertificate<'_>, quote: &Quote) -> Outcome {
     }
 }
 
+/// 4/5. Did Intel sign this quote, and is the platform's TCB acceptable?
+///
+/// Extracted out of [`verify`] so the mapping from an `attest::verify_quote` result to
+/// `(Check::QuoteSignature, Check::TcbStatus, AttestedTcb)` is testable offline without a live
+/// Intel signature — see VA-1 §6. `verify` calls this with the *literal* return value of
+/// `attest::verify_quote`, so there is exactly one implementation of this mapping in the crate;
+/// nothing here can drift from what `verify` actually records.
+///
+/// `attest::AttestError` is matched by name, not with a catch-all: it is this crate's own
+/// `#[non_exhaustive]` enum, and `#[non_exhaustive]` only forces a wildcard on *external* crates —
+/// in here a third variant would be a compile error at this match, the same discipline
+/// [`Outcome::label`] and `verdict::weight` use, rather than silently falling into the wrong arm.
+fn record_attestation(
+    verdict: Verdict,
+    result: Result<attest::Attested, attest::AttestError>,
+) -> Verdict {
+    match result {
+        Ok(attested) => {
+            // `tcb_status` is `UpToDate` here, by construction: `verify_quote` only reaches `Ok`
+            // after its own acceptance check passed.
+            let tcb = AttestedTcb::new(
+                attested.tcb_status().to_owned(),
+                attested.advisory_ids().to_vec(),
+            );
+            verdict
+                .record(Check::QuoteSignature, Outcome::Passed)
+                .record(Check::TcbStatus, Outcome::Passed)
+                .record_attested_tcb(tcb)
+        }
+        Err(
+            ref e @ attest::AttestError::TcbUnacceptable {
+                ref status,
+                ref advisory_ids,
+            },
+        ) => {
+            // Signature verified; platform is out of date. Keep "genuine but stale" distinguishable
+            // from "not genuine" — and surface the real status structurally as well as in the
+            // string.
+            let tcb = AttestedTcb::new(status.clone(), advisory_ids.clone());
+            let detail = e.to_string();
+            verdict
+                .record(Check::QuoteSignature, Outcome::Passed)
+                .record(Check::TcbStatus, Outcome::Failed(detail))
+                .record_attested_tcb(tcb)
+        }
+        Err(e @ attest::AttestError::SignatureInvalid { .. }) => verdict
+            .record(Check::QuoteSignature, Outcome::Failed(e.to_string()))
+            .record(
+                Check::TcbStatus,
+                Outcome::Skipped("signature did not verify".to_owned()),
+            ),
+        // No `AttestedTcb` on either arm above: nothing was attested.
+    }
+}
+
 /// Verify an endpoint against what was licensed.
 ///
 /// # Prefer `connect_verified` when you are about to use the connection
@@ -126,7 +181,6 @@ pub fn verify(
     licensed: &LicensedVersion,
     evidence: &Evidence<'_>,
     boot: Option<&BootReference>,
-    tcb: &TcbPolicy,
 ) -> Verdict {
     let mut verdict = Verdict::new();
 
@@ -168,35 +222,10 @@ pub fn verify(
     }
 
     // 4/5. Did Intel sign this quote, and is the platform's TCB acceptable?
-    match attest::verify_quote(
-        evidence.raw_quote,
-        evidence.collateral,
-        evidence.now_secs,
-        tcb,
-    ) {
-        Ok(attested) => {
-            verdict = verdict
-                .record(Check::QuoteSignature, Outcome::Passed)
-                .record(Check::TcbStatus, Outcome::Passed);
-            let _ = attested;
-        }
-        Err(e @ attest::AttestError::TcbUnacceptable { .. }) => {
-            // The signature verified; the platform is out of date. Recording the signature as
-            // passed is the honest reading, and it keeps "not genuine" distinguishable from
-            // "genuine but stale".
-            verdict = verdict
-                .record(Check::QuoteSignature, Outcome::Passed)
-                .record(Check::TcbStatus, Outcome::Failed(e.to_string()));
-        }
-        Err(e) => {
-            verdict = verdict
-                .record(Check::QuoteSignature, Outcome::Failed(e.to_string()))
-                .record(
-                    Check::TcbStatus,
-                    Outcome::Skipped("signature did not verify".to_owned()),
-                );
-        }
-    }
+    verdict = record_attestation(
+        verdict,
+        attest::verify_quote(evidence.raw_quote, evidence.collateral, evidence.now_secs),
+    );
 
     // 6. Does the measured configuration match the licensed one?
     match Quote::parse(evidence.raw_quote) {
@@ -255,4 +284,155 @@ pub fn verify(
     }
 
     verdict
+}
+
+#[cfg(test)]
+mod tests {
+    //! The assembled-verdict coverage for VA-1 negative (b) that is reachable offline: this runs
+    //! the *exact* production mapping `verify` calls, over constructed `attest` results — a live
+    //! Intel signature over a degraded platform cannot be fabricated offline (no committed fixture
+    //! can be one; collateral is platform-and-time-specific and expires), so this is where
+    //! "every degraded status stays untrustworthy" is actually exercised. See VA-1 §6.
+
+    // In a test a panic is the reporting mechanism, matching `channel.rs` and
+    // `connect/http.rs`'s in-module test blocks.
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use super::record_attestation;
+    use crate::attest::{AttestError, Attested};
+    use crate::verdict::{Check, Outcome, Verdict};
+
+    /// Every degraded/revoked status Intel actually emits, plus one it never would. The refusal
+    /// this whole change exists for.
+    fn every_degraded_status() -> [&'static str; 7] {
+        [
+            "OutOfDate",
+            "OutOfDateConfigurationNeeded",
+            "SWHardeningNeeded",
+            "ConfigurationNeeded",
+            "ConfigurationAndSWHardeningNeeded",
+            "Revoked",
+            "SomethingIntelHasNeverEmitted",
+        ]
+    }
+
+    /// A verdict with every essential check *other than* `QuoteSignature`/`TcbStatus` already
+    /// passing — everything `record_attestation` itself does not touch.
+    ///
+    /// Used so `!is_trustworthy()` below demonstrates the TCB refusal sinking an otherwise
+    /// trustworthy verdict, rather than an empty `Verdict::new()` that would read as untrustworthy
+    /// regardless of what `record_attestation` does to it.
+    fn every_other_essential_passing() -> Verdict {
+        Verdict::new()
+            .record(Check::ComposeHash, Outcome::Passed)
+            .record(Check::ImagesPinned, Outcome::Passed)
+            .record(Check::LicensedImagePresent, Outcome::Passed)
+            .record(Check::MrConfigId, Outcome::Passed)
+            .record(Check::ChannelBound, Outcome::Passed)
+    }
+
+    /// **The VV-01 bug, reproduced and refused.** A `TcbUnacceptable` — signature genuine, platform
+    /// degraded — must sink the verdict and surface the real status, never read as trustworthy.
+    ///
+    /// Seeded with every other essential already `Passed`, so `!is_trustworthy()` below actually
+    /// demonstrates the TCB refusal sinking an otherwise-trustworthy verdict — not merely restating
+    /// that an all-but-empty `Verdict` is untrustworthy regardless of what this test does to it,
+    /// which an earlier version of this test did (VA-1 review finding 3).
+    ///
+    /// Seen-to-fail: this test was run against a deliberately reverted arm that recorded
+    /// `Check::TcbStatus, Outcome::Passed` on `TcbUnacceptable` instead of `Failed` (the original
+    /// VV-01 shape) — `is_trustworthy()` returned `true` and the assertion below went red. Restored
+    /// to the arm in `record_attestation`, it is green. See the commit message for the transcript.
+    #[test]
+    fn a_degraded_status_fails_tcb_and_sinks_the_verdict() {
+        for status in every_degraded_status() {
+            let advisory_ids = vec!["INTEL-SA-00615".to_owned()];
+            let verdict = record_attestation(
+                every_other_essential_passing(),
+                Err(AttestError::TcbUnacceptable {
+                    status: status.to_owned(),
+                    advisory_ids: advisory_ids.clone(),
+                }),
+            );
+
+            assert!(
+                matches!(
+                    verdict.outcome(Check::QuoteSignature),
+                    Some(Outcome::Passed)
+                ),
+                "{status}: the hardware is genuine, and that must stay visible"
+            );
+            assert!(
+                matches!(verdict.outcome(Check::TcbStatus), Some(Outcome::Failed(_))),
+                "{status}: a degraded TCB must reach a refusal, not a pass"
+            );
+            assert!(
+                !verdict.is_trustworthy(),
+                "{status}: every other essential check passed, so the degraded TCB status alone \
+                 must be what sinks this verdict"
+            );
+
+            let tcb = verdict
+                .attested_tcb()
+                .unwrap_or_else(|| panic!("{status}: the real status must still be legible"));
+            assert_eq!(tcb.status(), status);
+            assert_eq!(tcb.advisory_ids(), advisory_ids.as_slice());
+            assert!(
+                !tcb.is_up_to_date(),
+                "{status}: AttestedTcb::is_up_to_date must agree with the refusal above — \
+                 pins that it shares one definition with is_tcb_acceptable rather than a second, \
+                 driftable copy"
+            );
+        }
+    }
+
+    /// Acceptance criterion 3: the real status must be legible **on a passing verdict**, not only
+    /// on a refusal.
+    ///
+    /// Seen-to-fail: dropping `.record_attested_tcb(tcb)` on the `Ok` arm of `record_attestation`
+    /// makes `attested_tcb()` `None` here — reverted and confirmed red, then restored. See the
+    /// commit message for the transcript.
+    #[test]
+    fn a_passing_verdict_shows_which_status_passed() {
+        let verdict = record_attestation(
+            Verdict::new(),
+            Ok(Attested::for_test(
+                "UpToDate",
+                vec!["INTEL-SA-00001".to_owned()],
+            )),
+        );
+
+        assert!(matches!(
+            verdict.outcome(Check::TcbStatus),
+            Some(Outcome::Passed)
+        ));
+        let tcb = verdict
+            .attested_tcb()
+            .expect("the status must be legible on a pass, not only on a refusal");
+        assert_eq!(tcb.status(), "UpToDate");
+        assert_eq!(tcb.advisory_ids(), ["INTEL-SA-00001".to_owned()].as_slice());
+        assert!(tcb.is_up_to_date());
+    }
+
+    /// A signature that never verified attests nothing — there is no platform statement to trust,
+    /// genuine or otherwise.
+    #[test]
+    fn a_bad_signature_records_no_attested_tcb() {
+        let verdict = record_attestation(
+            Verdict::new(),
+            Err(AttestError::SignatureInvalid {
+                detail: "chain did not verify".to_owned(),
+            }),
+        );
+
+        assert!(matches!(
+            verdict.outcome(Check::QuoteSignature),
+            Some(Outcome::Failed(_))
+        ));
+        assert!(matches!(
+            verdict.outcome(Check::TcbStatus),
+            Some(Outcome::Skipped(_))
+        ));
+        assert!(verdict.attested_tcb().is_none());
+    }
 }

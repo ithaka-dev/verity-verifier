@@ -16,7 +16,7 @@
     clippy::indexing_slicing
 )]
 
-use verity_verifier::attest::{Collateral, TcbPolicy};
+use verity_verifier::attest::Collateral;
 use verity_verifier::binding::ComposeHash;
 use verity_verifier::channel::PeerCertificate;
 use verity_verifier::quote::Quote;
@@ -87,7 +87,6 @@ macro_rules! run {
                 peer_certificate: PeerCertificate::NotConnected,
             },
             None,
-            &TcbPolicy::default(),
         )
     }};
 }
@@ -182,6 +181,15 @@ fn licensing_a_different_configuration_fails_mrconfigid() {
 
 // — the quote itself —
 
+/// **VA-1's assembled-`verify()` wiring test.** The genuine-signature-plus-degraded-TCB verdict
+/// cannot be produced offline (it needs a live Intel signature over a degraded platform, which no
+/// committed fixture can be — see `attest.rs`'s module doc), so this is the offline-reachable arm
+/// of negative (b): a signature that never verified must attest nothing, through the *actual*
+/// public `verify()`, whose only TCB mapping is `record_attestation`.
+///
+/// Seen-to-fail: temporarily made the `SignatureInvalid` arm of `record_attestation` populate an
+/// `AttestedTcb` (the shape a bug here would take) — `attested_tcb().is_none()` went red. Reverted;
+/// green again with the real mapping. See the commit message for the transcript.
 #[test]
 fn garbage_quote_fails_signature_and_mrconfigid() {
     let v = run!(vec![0u8; 700], COMPOSE.to_vec(), licensed());
@@ -194,6 +202,10 @@ fn garbage_quote_fails_signature_and_mrconfigid() {
         Some(Outcome::Failed(_))
     ));
     assert!(!v.is_trustworthy());
+    assert!(
+        v.attested_tcb().is_none(),
+        "no signature verified, so there is no platform statement to attest"
+    );
 }
 
 /// T-15: on an unparseable quote, `BootMeasurements` stays `Skipped` — moot, because `MrConfigId`
@@ -311,6 +323,10 @@ fn boot_reference_has_no_rtmr3_field() {
 // — the verdict itself —
 
 /// A verdict must never claim more than it checked.
+///
+/// The other half of VA-1's assembled-`verify()` wiring test: a real quote against placeholder
+/// collateral still cannot produce a genuine signature, so `attested_tcb()` must stay `None` here
+/// too.
 #[test]
 fn skipped_essentials_are_not_trustworthy() {
     let v = run!(quote_bytes(), COMPOSE.to_vec(), licensed());
@@ -318,6 +334,7 @@ fn skipped_essentials_are_not_trustworthy() {
     // whatever else passed.
     assert!(!v.is_trustworthy());
     assert!(v.missing_essentials().contains(&Check::QuoteSignature));
+    assert!(v.attested_tcb().is_none());
 }
 
 #[test]

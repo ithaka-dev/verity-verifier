@@ -1,9 +1,15 @@
-//! Signature-chain verification and TCB policy.
+//! Signature-chain verification.
 //!
 //! The real quote fixture cannot be *positively* verified offline: doing so needs Intel collateral
 //! for that specific platform at that specific time, which is not committed and would expire.
-//! What is tested here is everything that must hold regardless — refusals, policy, and the
-//! separation between "not genuine" and "genuine but out of date".
+//! What is tested here is everything that must hold regardless — refusals, and the separation
+//! between "not genuine" and "genuine but out of date".
+//!
+//! **TCB acceptance itself has no public surface to test from here any more.** VA-1 removed
+//! `TcbPolicy`; the enforced rule is `verdict::is_tcb_acceptable`, `pub(crate)` and shared with
+//! `AttestedTcb::is_up_to_date` (VA-1 review finding 2 — one definition, not two that happened to
+//! agree), and its behavioural tests (the T-01 suite this file used to carry) live in
+//! `src/verdict.rs`'s `tcb_acceptance_tests` module, alongside the function they test.
 
 #![allow(
     clippy::expect_used,
@@ -12,7 +18,7 @@
     clippy::indexing_slicing
 )]
 
-use verity_verifier::attest::{collateral_from_json, AttestError, CollateralError, TcbPolicy};
+use verity_verifier::attest::{collateral_from_json, AttestError, CollateralError};
 
 const QUOTE_HEX: &str = include_str!("fixtures/quote-v4-dstack-0.5.7.hex");
 
@@ -28,31 +34,13 @@ fn quote_bytes() -> Vec<u8> {
         .collect()
 }
 
-// — TCB policy —
-
-/// The default must be the strict one. A permissive default is how an out-of-date platform gets
-/// accepted by someone who never thought about it.
-#[test]
-fn default_policy_accepts_only_up_to_date() {
-    assert_eq!(TcbPolicy::default(), TcbPolicy::up_to_date_only());
-}
-
-/// There is deliberately no "accept anything" constructor — tolerating a degraded platform must be
-/// spelled out at the call site.
-#[test]
-fn looser_policy_requires_naming_the_statuses() {
-    let policy = TcbPolicy::accepting(["UpToDate".to_owned(), "SWHardeningNeeded".to_owned()]);
-    assert_ne!(policy, TcbPolicy::default());
-}
-
 // — refusals —
 
 /// Garbage must be refused as a signature failure, not accepted or panicked on.
 #[test]
 fn garbage_is_refused() {
     let collateral = minimal_collateral();
-    match verity_verifier::attest::verify_quote(&[0u8; 128], &collateral, 0, &TcbPolicy::default())
-    {
+    match verity_verifier::attest::verify_quote(&[0u8; 128], &collateral, 0) {
         Err(AttestError::SignatureInvalid { .. }) => {}
         other => panic!("expected SignatureInvalid, got {other:?}"),
     }
@@ -62,12 +50,8 @@ fn garbage_is_refused() {
 /// sufficient — the chain has to check out against Intel.
 #[test]
 fn real_quote_without_valid_collateral_is_refused() {
-    let result = verity_verifier::attest::verify_quote(
-        &quote_bytes(),
-        &minimal_collateral(),
-        1_800_000_000,
-        &TcbPolicy::default(),
-    );
+    let result =
+        verity_verifier::attest::verify_quote(&quote_bytes(), &minimal_collateral(), 1_800_000_000);
     assert!(
         result.is_err(),
         "a quote must not verify against collateral that does not attest it"
@@ -112,78 +96,6 @@ fn minimal_collateral() -> verity_verifier::attest::Collateral {
         qe_identity: "{}".to_owned(),
         qe_identity_signature: Vec::new(),
         pck_certificate_chain: None,
-    }
-}
-
-// — T-01: the mechanism ADR 0014 makes mandatory —
-//
-// Until these existed, the policy was asserted only by *identity* — that the default equalled
-// `up_to_date_only()` — and never by *behaviour*. Nothing demonstrated it refusing anything,
-// because the predicate was private and reachable only through a verification needing live Intel
-// collateral. A rule exercised only against the network has no unit test.
-
-/// The refusal the whole policy exists for.
-#[test]
-fn the_default_policy_refuses_every_degraded_status() {
-    let policy = TcbPolicy::default();
-    assert!(policy.accepts("UpToDate"));
-
-    // Every status Intel actually emits other than UpToDate. Each means the platform is running
-    // with known weaknesses, and accepting one silently is the outcome ADR 0014 forbids.
-    for degraded in [
-        "OutOfDate",
-        "OutOfDateConfigurationNeeded",
-        "SWHardeningNeeded",
-        "ConfigurationNeeded",
-        "ConfigurationAndSWHardeningNeeded",
-        "Revoked",
-    ] {
-        assert!(
-            !policy.accepts(degraded),
-            "{degraded} must be refused by default"
-        );
-    }
-}
-
-/// An unknown status is refused rather than treated as benign. A status this crate has never heard
-/// of is a status it cannot reason about, and the safe reading of "I do not know" is "no".
-#[test]
-fn an_unrecognised_status_is_refused() {
-    let policy = TcbPolicy::default();
-    for unknown in ["", "Fine", "UpToDateish", "UPTODATE_BUT_ACTUALLY_NOT", "🙂"] {
-        assert!(!policy.accepts(unknown), "{unknown:?} must be refused");
-    }
-}
-
-/// Widening accepts exactly what it names and nothing adjacent.
-#[test]
-fn accepting_widens_only_what_it_names() {
-    let policy = TcbPolicy::accepting(["SWHardeningNeeded".to_owned()]);
-
-    assert!(policy.accepts("SWHardeningNeeded"));
-    // Not even UpToDate, unless it was named — the list is the whole policy, not an addition to a
-    // default. A caller who forgets that gets a refusal, which is the safe direction.
-    assert!(!policy.accepts("UpToDate"));
-    assert!(!policy.accepts("ConfigurationAndSWHardeningNeeded"));
-    assert!(!policy.accepts("OutOfDate"));
-}
-
-/// Intel's casing is not something a caller should have to match exactly.
-#[test]
-fn status_comparison_is_case_insensitive() {
-    let policy = TcbPolicy::default();
-    for spelling in ["uptodate", "UPTODATE", "UpToDate", "uPtOdAtE"] {
-        assert!(policy.accepts(spelling), "{spelling} must be accepted");
-    }
-}
-
-/// An empty policy accepts nothing. There is deliberately no "accept anything" constructor, so this
-/// is the most permissive mistake available and it fails closed.
-#[test]
-fn an_empty_policy_accepts_nothing() {
-    let policy = TcbPolicy::accepting(Vec::new());
-    for status in ["UpToDate", "OutOfDate", ""] {
-        assert!(!policy.accepts(status));
     }
 }
 
@@ -249,7 +161,7 @@ fn a_tampered_quote_is_refused_as_a_signature_failure() {
     let position = tampered.len() - 64;
     tampered[position] ^= 0b0000_0001;
 
-    match verity_verifier::attest::verify_quote(&tampered, &collateral, 0, &TcbPolicy::default()) {
+    match verity_verifier::attest::verify_quote(&tampered, &collateral, 0) {
         Err(AttestError::SignatureInvalid { .. }) => {}
         other => panic!("expected SignatureInvalid, got {other:?}"),
     }
@@ -264,8 +176,7 @@ fn a_truncated_quote_is_refused_rather_than_panicking() {
 
     for fraction in [1, 2, 4, 8, 16] {
         let truncated = &full[..full.len() / fraction];
-        let result =
-            verity_verifier::attest::verify_quote(truncated, &collateral, 0, &TcbPolicy::default());
+        let result = verity_verifier::attest::verify_quote(truncated, &collateral, 0);
         assert!(
             result.is_err(),
             "a {fraction}-way truncation must be refused"

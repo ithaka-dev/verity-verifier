@@ -24,7 +24,7 @@
     clippy::indexing_slicing
 )]
 
-use verity_verifier::attest::{Collateral, TcbPolicy};
+use verity_verifier::attest::Collateral;
 use verity_verifier::binding::ComposeHash;
 use verity_verifier::channel::{ChannelBindError, ChannelBinding, PeerCertificate};
 use verity_verifier::quote::Quote;
@@ -321,7 +321,6 @@ fn a_verdict_without_a_connection_is_not_trustworthy_and_says_so() {
             peer_certificate: PeerCertificate::NotConnected,
         },
         None,
-        &TcbPolicy::default(),
     );
 
     // T-14 (MA-6). **Not a general guard on this `verify()` call** — `boot: None` above traverses
@@ -373,7 +372,6 @@ fn a_relayed_certificate_fails_channel_bound_while_the_configuration_checks_stil
             peer_certificate: PeerCertificate::Presented(&leaf),
         },
         None,
-        &TcbPolicy::default(),
     );
 
     match verdict.outcome(Check::ChannelBound) {
@@ -419,7 +417,6 @@ fn the_matching_certificate_passes_channel_bound() {
             peer_certificate: PeerCertificate::Presented(&leaf),
         },
         None,
-        &TcbPolicy::default(),
     );
 
     assert_eq!(
@@ -448,7 +445,6 @@ fn an_unparseable_quote_fails_channel_bound_rather_than_leaving_it_unrun() {
             peer_certificate: PeerCertificate::Presented(&leaf),
         },
         None,
-        &TcbPolicy::default(),
     );
 
     assert!(matches!(

@@ -44,7 +44,7 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest as _, Sha512};
 
-use verity_verifier::attest::{Collateral, TcbPolicy};
+use verity_verifier::attest::Collateral;
 use verity_verifier::binding::ComposeHash;
 use verity_verifier::connect::{
     connect_verified, CollateralSource, CollateralUnavailable, ConnectOptions, ConnectRequest,
@@ -299,8 +299,7 @@ fn licensed() -> LicensedVersion {
 fn refusal_from(port: u16, source: &dyn CollateralSource) -> Refusal {
     let endpoint = endpoint_for(port);
     let licensed = licensed();
-    let tcb = TcbPolicy::default();
-    let request = ConnectRequest::new(&endpoint, &licensed, b"{}".to_vec(), &tcb);
+    let request = ConnectRequest::new(&endpoint, &licensed, b"{}".to_vec());
     connect_verified(&request, source, &ConnectOptions::default())
         .map(|_| ())
         .expect_err("no local endpoint can produce a trustworthy verdict")
@@ -321,8 +320,7 @@ fn a_terminating_endpoint_is_refused_before_any_socket_is_opened() {
     )
     .expect("endpoint");
     let licensed = licensed();
-    let tcb = TcbPolicy::default();
-    let request = ConnectRequest::new(&endpoint, &licensed, b"{}".to_vec(), &tcb);
+    let request = ConnectRequest::new(&endpoint, &licensed, b"{}".to_vec());
 
     let refusal = connect_verified(&request, &Minimal, &ConnectOptions::default())
         .map(|_| ())
@@ -753,8 +751,7 @@ fn an_untrustworthy_verdict_cannot_produce_a_client() {
 
     let endpoint = endpoint_for(port);
     let licensed = licensed();
-    let tcb = TcbPolicy::default();
-    let request = ConnectRequest::new(&endpoint, &licensed, b"{}".to_vec(), &tcb);
+    let request = ConnectRequest::new(&endpoint, &licensed, b"{}".to_vec());
 
     let outcome = connect_verified(&request, &Minimal, &ConnectOptions::default());
     assert!(
@@ -772,10 +769,9 @@ fn an_untrustworthy_verdict_cannot_produce_a_client() {
 fn a_boot_reference_can_be_supplied_after_construction() {
     let endpoint = endpoint_for(1);
     let licensed = licensed();
-    let tcb = TcbPolicy::default();
     let boot = verity_verifier::reference::BootReference::default();
 
-    let mut request = ConnectRequest::new(&endpoint, &licensed, b"{}".to_vec(), &tcb);
+    let mut request = ConnectRequest::new(&endpoint, &licensed, b"{}".to_vec());
     assert!(request.boot.is_none());
     request.boot = Some(&boot);
     assert_eq!(request.boot, Some(&boot));

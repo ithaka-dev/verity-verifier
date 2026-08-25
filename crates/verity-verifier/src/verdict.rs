@@ -471,12 +471,130 @@ pub fn transcript_line(check: Check, outcome: &Outcome) -> String {
     format!("  {:<22} {rendered}", check.name())
 }
 
+/// Intel's TCB statement about the platform a verdict is about.
+///
+/// Verdict-level provenance, like [`Verdict::verifier_version`] and
+/// [`Verdict::reference_data_date`] — *not* a check outcome. It is present whenever a signature
+/// verified, on a passing `UpToDate` as well as on a refused degraded status, so a reader can
+/// always see which status was judged and any advisories Intel published. It is descriptive:
+/// [`Verdict::is_trustworthy`] never reads it — the enforcement lives in `is_tcb_acceptable`,
+/// which runs (via `attest::verify_quote`) before this is ever recorded.
+///
+/// **No `#[non_exhaustive]`.** Both fields are private with no public constructor but
+/// `AttestedTcb::new`, so the attribute would add nothing here: it exists to stop a
+/// struct-literal or exhaustive-destructure from another crate, and private fields already do
+/// that. Contrast `connect::CollateralUnavailable`, which needs it because it has a public field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestedTcb {
+    status: String,
+    advisory_ids: Vec<String>,
+}
+
+#[cfg(feature = "attest")]
+impl AttestedTcb {
+    /// Construct from a verified quote's status.
+    ///
+    /// `pub(crate)` on purpose: this type is *read* by external callers off a [`Verdict`], never
+    /// built by them. The only production caller is `verify::record_attestation`, mapping an
+    /// `attest::Attested` or `attest::AttestError::TcbUnacceptable` across the module boundary —
+    /// `verdict` stays free of the `attest` feature, so it cannot name those types itself and the
+    /// conversion happens on the gated side instead. Keeping the constructor crate-internal
+    /// preserves "a verdict's TCB statement comes from the verifier, not from a caller", the same
+    /// posture as VA-1's removal of the caller-configurable TCB policy type.
+    ///
+    /// `#[cfg(feature = "attest")]`, unlike the accessors below: nothing can construct an
+    /// `AttestedTcb` without a signature to attest in the first place, so without `attest` this
+    /// constructor is unreachable dead code rather than a real capability being hidden — `Verdict`
+    /// itself, and reading a `None` off `attested_tcb()`, both stay available on every target.
+    #[must_use]
+    pub(crate) fn new(status: String, advisory_ids: Vec<String>) -> Self {
+        Self {
+            status,
+            advisory_ids,
+        }
+    }
+}
+
+impl AttestedTcb {
+    /// Intel's TCB status for this platform, e.g. `UpToDate`.
+    #[must_use]
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    /// Advisory identifiers Intel associates with this platform's TCB level.
+    #[must_use]
+    pub fn advisory_ids(&self) -> &[String] {
+        &self.advisory_ids
+    }
+
+    /// Whether Intel considers this platform up to date. The property the verifier enforces.
+    #[must_use]
+    pub fn is_up_to_date(&self) -> bool {
+        is_tcb_acceptable(&self.status)
+    }
+}
+
+/// The one enforced rule: only `UpToDate` is acceptable.
+///
+/// [ADR 0014] decision 2 makes TCB enforcement mandatory and not a caller's choice — "no option, no
+/// override, no strict mode that can be left off" — so there is exactly one definition of the rule
+/// in the crate, called from both sides of the `attest`/`verdict` boundary: `attest::verify_quote`
+/// enforces it before an `Attested` can exist at all, and `AttestedTcb::is_up_to_date` reports it
+/// afterward on whatever was recorded. Defined here, in the ungated module, so `attest` (gated) can
+/// depend on it without `verdict` ever depending back on `attest` — the same direction
+/// `AttestedTcb::new` already established.
+///
+/// `pub(crate)`: nothing outside the crate needs the raw predicate, only the two methods that read
+/// off it. Case-insensitive: Intel's casing is not something a caller should have to match exactly.
+///
+/// [ADR 0014]: https://github.com/ithaka-dev/verity-foundation/blob/main/docs/decisions/0014-verifier-update-discipline.md
+pub(crate) fn is_tcb_acceptable(status: &str) -> bool {
+    status.eq_ignore_ascii_case("UpToDate")
+}
+
+#[cfg(test)]
+mod tcb_acceptance_tests {
+    //! The single definition of TCB acceptance, tested once here rather than once per caller.
+    //! `attest.rs` no longer has its own copy to test — see VA-1 review finding 2.
+
+    use super::is_tcb_acceptable;
+
+    #[test]
+    fn only_up_to_date_is_acceptable() {
+        for accepted in ["UpToDate", "uptodate", "UPTODATE", "uPtOdAtE"] {
+            assert!(is_tcb_acceptable(accepted), "{accepted} must be accepted");
+        }
+
+        // Every status Intel actually emits other than UpToDate, plus unrecognised input. Each
+        // means either a known platform weakness or an unknown answer this crate cannot reason
+        // about — and accepting either silently is the outcome ADR 0014 forbids.
+        for degraded in [
+            "OutOfDate",
+            "OutOfDateConfigurationNeeded",
+            "SWHardeningNeeded",
+            "ConfigurationNeeded",
+            "ConfigurationAndSWHardeningNeeded",
+            "Revoked",
+            "",
+            "Fine",
+            "UpToDateish",
+            "🙂",
+        ] {
+            assert!(!is_tcb_acceptable(degraded), "{degraded} must be refused");
+        }
+    }
+}
+
 /// The result of verifying an endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
     verifier_version: &'static str,
     reference_data_date: &'static str,
     results: Vec<(Check, Outcome)>,
+    /// Intel's TCB statement, when a signature verified. `None` on every path that verified none —
+    /// including the WASM `compose_only_verdict` path, which has no collateral at all.
+    tcb: Option<AttestedTcb>,
 }
 
 impl Verdict {
@@ -487,6 +605,7 @@ impl Verdict {
             verifier_version: VERIFIER_VERSION,
             reference_data_date: crate::reference::REFERENCE_DATA_DATE,
             results: Vec::new(),
+            tcb: None,
         }
     }
 
@@ -495,6 +614,15 @@ impl Verdict {
     pub fn record(mut self, check: Check, outcome: Outcome) -> Self {
         self.results.push((check, outcome));
         self
+    }
+
+    /// Intel's TCB statement, when a signature verified.
+    ///
+    /// `None` when it did not, or when this construction cannot verify one at all — the WASM
+    /// `compose_only_verdict` path has no collateral and no `attest` feature.
+    #[must_use]
+    pub fn attested_tcb(&self) -> Option<&AttestedTcb> {
+        self.tcb.as_ref()
     }
 
     /// Which verifier produced this.
@@ -602,6 +730,28 @@ impl Verdict {
     }
 }
 
+#[cfg(feature = "attest")]
+impl Verdict {
+    /// Record the attested TCB statement. Builder-style, like [`Verdict::record`].
+    ///
+    /// `pub(crate)`, unlike [`Verdict::record`]: `Check`/[`Outcome`] are fully public and
+    /// constructible outside the crate (the wasm crate's `compose_only_verdict` calls `record`
+    /// cross-crate), so keeping that one `pub` grants nothing new. `AttestedTcb` has no public
+    /// constructor at all — only `AttestedTcb::new`, itself `pub(crate)` — so no external caller
+    /// could pass a meaningful argument here regardless. Matches the "a verdict's TCB statement
+    /// comes from the verifier, not a caller" posture `AttestedTcb::new`'s own doc states.
+    ///
+    /// `#[cfg(feature = "attest")]`, like `AttestedTcb::new`: the only production caller,
+    /// `verify::record_attestation`, is itself gated behind `attest`, so without it this method is
+    /// unreachable dead code rather than a real capability being hidden — [`Verdict::attested_tcb`]
+    /// stays available on every target, correctly returning `None` where nothing was attested.
+    #[must_use]
+    pub(crate) fn record_attested_tcb(mut self, tcb: AttestedTcb) -> Self {
+        self.tcb = Some(tcb);
+        self
+    }
+}
+
 impl Default for Verdict {
     fn default() -> Self {
         Self::new()
@@ -703,6 +853,17 @@ impl fmt::Display for Verdict {
             "verity-verifier {} (reference data {})",
             self.verifier_version, self.reference_data_date
         )?;
+        // Human `Display` only — not the shell contract `transcript_line` is. Printed once, next to
+        // the version/date header rather than inside the per-check loop below, because it is
+        // provenance about the platform rather than one more check's outcome.
+        if let Some(tcb) = &self.tcb {
+            let advisories = if tcb.advisory_ids.is_empty() {
+                String::new()
+            } else {
+                format!(" (advisories: {})", tcb.advisory_ids.join(", "))
+            };
+            writeln!(f, "  platform TCB: {}{advisories}", tcb.status)?;
+        }
         // 14-column label field, widened from 8 to fit `indeterminate` (13 characters) with at
         // least one space of separation — the same guarantee `transcript_line`'s `{:<22}` makes for
         // check names. A shorter word just for `Display` would put a fifth spelling into a

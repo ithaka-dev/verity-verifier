@@ -2,7 +2,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use verity_verifier::attest::{Collateral, TcbPolicy};
+use verity_verifier::attest::Collateral;
 use verity_verifier::binding::ComposeHash;
 use verity_verifier::channel::PeerCertificate;
 use verity_verifier::quote::Quote;
@@ -200,7 +200,6 @@ fn verify_with_no_boot_reference_records_indeterminate_reference_unavailable() {
             peer_certificate: PeerCertificate::NotConnected,
         },
         None,
-        &TcbPolicy::default(),
     );
 
     match verdict.outcome(Check::BootMeasurements) {

@@ -68,9 +68,9 @@
 //! # Using it
 //!
 //! ```no_run
+//! use verity_verifier::binding::ComposeHash;
 //! use verity_verifier::channel::PeerCertificate;
 //! use verity_verifier::verify::{verify, Evidence, LicensedVersion};
-//! use verity_verifier::{attest::TcbPolicy, binding::ComposeHash};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # let (raw_quote, compose_document, collateral) = (vec![], vec![], unimplemented!());
@@ -93,7 +93,6 @@
 //!         peer_certificate: PeerCertificate::Presented(&leaf_cert_der),
 //!     },
 //!     None,
-//!     &TcbPolicy::default(),
 //! );
 //!
 //! // Never a bare boolean: the verdict says which checks ran, and what each concluded.

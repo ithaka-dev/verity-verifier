@@ -54,7 +54,7 @@
 
 use std::process::ExitCode;
 
-use verity_verifier::attest::{Collateral, TcbPolicy};
+use verity_verifier::attest::Collateral;
 use verity_verifier::binding::ComposeHash;
 use verity_verifier::connect::{
     connect_verified, CollateralSource, CollateralUnavailable, ConnectOptions, ConnectRequest,
@@ -159,8 +159,7 @@ fn main() -> ExitCode {
         compose_hash,
         image_digest,
     };
-    let tcb = TcbPolicy::default();
-    let mut request = ConnectRequest::new(&endpoint, &licensed, compose_document, &tcb);
+    let mut request = ConnectRequest::new(&endpoint, &licensed, compose_document);
     request.boot = boot.as_ref();
 
     let runtime = match tokio::runtime::Runtime::new() {

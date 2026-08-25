@@ -48,7 +48,7 @@ mod tls;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::attest::{Collateral, TcbPolicy};
+use crate::attest::Collateral;
 use crate::channel::ChannelBinding;
 use crate::compose::DEFAULT_CONNECT_TIMEOUT;
 use crate::endpoint::{Endpoint, EndpointForm};
@@ -108,29 +108,28 @@ pub struct ConnectRequest<'a> {
     /// verify again. Contrast the certificate, whose absence is not legitimate for a verdict about
     /// an endpoint at all.
     pub boot: Option<&'a BootReference>,
-    /// Which Intel TCB statuses to accept.
-    pub tcb: &'a TcbPolicy,
 }
 
 impl<'a> ConnectRequest<'a> {
-    /// A request with no boot reference and the default TCB policy.
+    /// A request with no boot reference.
     ///
     /// A constructor rather than a `Default`: the three arguments here are the ones with no
-    /// defensible default, and `tcb` is defaulted to [`TcbPolicy::up_to_date_only`], which is the
-    /// strict end. Anything looser stays an explicit, visible choice at the call site.
+    /// defensible default. There is no TCB acceptance to configure — [ADR 0014] decision 2 makes
+    /// that mandatory and not a caller's choice, enforced structurally inside `attest::verify_quote`
+    /// regardless of how this request was built.
+    ///
+    /// [ADR 0014]: https://github.com/ithaka-dev/verity-foundation/blob/main/docs/decisions/0014-verifier-update-discipline.md
     #[must_use]
     pub fn new(
         endpoint: &'a Endpoint,
         licensed: &'a LicensedVersion,
         compose_document: Vec<u8>,
-        tcb: &'a TcbPolicy,
     ) -> Self {
         Self {
             endpoint,
             licensed,
             compose_document,
             boot: None,
-            tcb,
         }
     }
 }

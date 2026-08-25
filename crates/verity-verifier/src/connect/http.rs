@@ -67,7 +67,6 @@ pub(super) struct OwnedRequest {
     pub(super) licensed: crate::verify::LicensedVersion,
     pub(super) compose_document: Vec<u8>,
     pub(super) boot: Option<crate::reference::BootReference>,
-    pub(super) tcb: crate::attest::TcbPolicy,
 }
 
 impl OwnedRequest {
@@ -77,7 +76,6 @@ impl OwnedRequest {
             licensed: request.licensed.clone(),
             compose_document: request.compose_document.clone(),
             boot: request.boot.cloned(),
-            tcb: request.tcb.clone(),
         }
     }
 }
@@ -180,7 +178,6 @@ impl VerifiedConnector {
                 peer_certificate: crate::channel::PeerCertificate::Presented(&handshook.leaf_der),
             },
             self.request.boot.as_ref(),
-            &self.request.tcb,
         );
 
         // — the post-verify guard —
@@ -868,7 +865,6 @@ mod tests {
                 },
                 compose_document: b"{}".to_vec(),
                 boot: None,
-                tcb: crate::attest::TcbPolicy::default(),
             },
             options: options.clone(),
             tls: crate::connect::tls::client_config(),

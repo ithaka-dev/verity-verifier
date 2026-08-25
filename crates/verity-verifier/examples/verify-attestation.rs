@@ -45,7 +45,7 @@
 
 use std::process::ExitCode;
 
-use verity_verifier::attest::{Collateral, TcbPolicy};
+use verity_verifier::attest::Collateral;
 use verity_verifier::binding::ComposeHash;
 use verity_verifier::channel::PeerCertificate;
 use verity_verifier::endpoint::{Endpoint, EndpointForm};
@@ -207,7 +207,6 @@ async fn main() -> ExitCode {
             peer_certificate,
         },
         boot.as_ref(),
-        &TcbPolicy::default(),
     );
 
     report_transcript(&verdict);

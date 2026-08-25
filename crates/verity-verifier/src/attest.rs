@@ -25,6 +25,8 @@
 
 use dcap_qvl::{verify::verify as qvl_verify, QuoteCollateralV3};
 
+use crate::verdict::is_tcb_acceptable;
+
 /// Intel collateral needed to verify a quote.
 ///
 /// Obtained from a PCCS or Intel PCS. Re-exported rather than wrapped so callers can supply
@@ -57,7 +59,25 @@ impl Attested {
     /// Whether Intel considers this platform's TCB up to date.
     #[must_use]
     pub fn is_up_to_date(&self) -> bool {
-        self.tcb_status.eq_ignore_ascii_case("UpToDate")
+        is_tcb_acceptable(&self.tcb_status)
+    }
+}
+
+#[cfg(test)]
+impl Attested {
+    /// Build a value directly, bypassing `verify_quote`.
+    ///
+    /// Test-only: production never constructs one except inside `verify_quote` itself, as a struct
+    /// literal in this same module. This exists so `verify.rs`'s `record_attestation` tests can
+    /// drive the *exact* production mapping over every TCB status without a live Intel signature —
+    /// VA-1 §6. `#[cfg(test)]` rather than a permanent `pub(crate) fn` keeps it out of ordinary
+    /// builds; it is visible crate-wide only while `cfg(test)` is set, which is what lets
+    /// `verify.rs`'s own `#[cfg(test)]` module reach it.
+    pub(crate) fn for_test(tcb_status: impl Into<String>, advisory_ids: Vec<String>) -> Self {
+        Self {
+            tcb_status: tcb_status.into(),
+            advisory_ids,
+        }
     }
 }
 
@@ -94,58 +114,6 @@ fn advisories(ids: &[String]) -> String {
     }
 }
 
-/// Which TCB statuses a caller will accept.
-///
-/// Defaults to up-to-date only. Anything looser is an explicit, visible choice at the call site
-/// rather than a flag buried in a build configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct TcbPolicy {
-    accepted: Vec<String>,
-}
-
-impl Default for TcbPolicy {
-    fn default() -> Self {
-        Self::up_to_date_only()
-    }
-}
-
-impl TcbPolicy {
-    /// Accept only `UpToDate`.
-    #[must_use]
-    pub fn up_to_date_only() -> Self {
-        Self {
-            accepted: vec!["UpToDate".to_owned()],
-        }
-    }
-
-    /// Accept the listed statuses.
-    ///
-    /// Deliberately requires naming them. There is no "accept anything" constructor, because the
-    /// difference between *deciding* to tolerate an out-of-date platform and *failing to notice*
-    /// one is the entire point of surfacing this.
-    #[must_use]
-    pub fn accepting(statuses: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            accepted: statuses.into_iter().collect(),
-        }
-    }
-
-    /// Whether this policy accepts a given TCB status.
-    ///
-    /// Public because the decision is worth inspecting rather than only observing. A caller can ask
-    /// before verifying, or explain a refusal afterwards — and it makes the policy directly
-    /// testable, which matters because ADR 0014 makes TCB enforcement mandatory and the mechanism
-    /// was previously reachable only through a verification requiring live Intel collateral. A rule
-    /// that can only be exercised against the network is a rule with no unit test.
-    ///
-    /// Case-insensitive: Intel's casing is not something a caller should have to match exactly.
-    #[must_use]
-    pub fn accepts(&self, status: &str) -> bool {
-        self.accepted.iter().any(|a| a.eq_ignore_ascii_case(status))
-    }
-}
-
 /// Verify a quote's signature chain against Intel, using supplied collateral.
 ///
 /// `now_secs` is the verification time as a Unix timestamp, passed in rather than read from a clock
@@ -155,12 +123,14 @@ impl TcbPolicy {
 /// # Errors
 ///
 /// Returns [`AttestError::SignatureInvalid`] if the chain does not verify, or
-/// [`AttestError::TcbUnacceptable`] if it does but the platform's TCB status is outside `policy`.
+/// [`AttestError::TcbUnacceptable`] if it does but the platform's TCB status is not `UpToDate`.
+/// That rule is not a parameter — see [ADR 0014] decision 2.
+///
+/// [ADR 0014]: https://github.com/ithaka-dev/verity-foundation/blob/main/docs/decisions/0014-verifier-update-discipline.md
 pub fn verify_quote(
     raw_quote: &[u8],
     collateral: &Collateral,
     now_secs: u64,
-    policy: &TcbPolicy,
 ) -> Result<Attested, AttestError> {
     let report =
         qvl_verify(raw_quote, collateral, now_secs).map_err(|e| AttestError::SignatureInvalid {
@@ -170,7 +140,7 @@ pub fn verify_quote(
     let status = report.status.clone();
     let advisory_ids = report.advisory_ids.clone();
 
-    if !policy.accepts(&status) {
+    if !is_tcb_acceptable(&status) {
         return Err(AttestError::TcbUnacceptable {
             status,
             advisory_ids,

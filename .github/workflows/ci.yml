@@ -160,7 +160,7 @@ jobs:
       - run: cargo test -p verity-verifier --no-default-features --features connect --lib
 
   no-dangerous-attestation:
-    name: TCB enforcement is not overridable
+    name: TCB enforcement is mandatory — not overridable, not caller-configurable
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -178,6 +178,27 @@ jobs:
         run: |
           if grep -rn "dangerous_verify_with_tcb_override" crates/ 2>/dev/null; then
             echo "::error::TCB override API is called; ADR 0014 forbids it"; exit 1
+          fi
+      # VA-1 / ADR 0014 decision 2: TCB acceptance is not a caller's choice either, so the old
+      # `TcbPolicy` knob (and its `accepting`/`accepts` methods) must not reappear under this
+      # spelling. This is a name-based check, not an arity-independent one — `tests/tcb_enforcement.rs`
+      # is the layer that catches a policy parameter returning under a different name.
+      # `is_tcb_acceptable` and `Attested::is_up_to_date` do not match this pattern.
+      #
+      # Grepped over `crates/` directly, like the two steps above — not over `crates/*/src
+      # crates/*/examples`. A glob with no current match (e.g. if `examples/` is ever removed)
+      # expands to nothing under `nullglob`, or is left as a literal, unmatched path under bash's
+      # default: either way `grep` reports "No such file or directory" and exits 2, which `if grep
+      # ...; then` treats identically to "no match found" — a security guard that disarms itself
+      # exactly when a directory it depends on goes missing. `tests/` is excluded rather than left
+      # out of the walk entirely, because `tests/attest.rs` and `tests/tcb_enforcement.rs`
+      # legitimately name the deleted type in doc comments explaining its removal.
+      - name: no caller-configurable TCB policy
+        run: |
+          if grep -rnE '\bTcbPolicy\b|fn +accepting|fn +accepts' \
+              crates/ --include='*.rs' --exclude-dir=tests 2>/dev/null; then
+            echo "::error::a caller-configurable TCB status policy was reintroduced; VA-1 / ADR 0014 decision 2 forbid it"
+            exit 1
           fi
 
   supply-chain:
