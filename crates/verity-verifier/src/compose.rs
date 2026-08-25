@@ -22,6 +22,68 @@
 
 use core::fmt;
 
+/// A content identifier whose string form is safe to interpolate into a request URL.
+///
+/// The invariant is **interpolation-safety, not CID validity**: the inner string contains only
+/// ASCII alphanumeric characters, `-`, or `_` — a conservative *subset* of the multibase alphabets
+/// IPFS actually uses for `ipfs://` addressing (base32 `b…`, the `CIDv1` default; base58btc `Qm…`;
+/// base36 `k…`; base16 `f…` are all within this set). It is deliberately **not** a claim that the
+/// value is a structurally valid CID — retrieval is outside the trust model (see the module docs),
+/// so CID validity is not this type's job, and a wrong document is caught by the hash check
+/// regardless of where it came from or what shape it claims to be.
+///
+/// # Why this is an allowlist, not a blacklist
+///
+/// Every byte not explicitly permitted is rejected — `/ ? # & % : @ [ ] .`, all whitespace
+/// (including CR/LF), every ASCII control byte, and every non-ASCII byte are all excluded because
+/// none of them is on the list, not because someone remembered to name them. That is what makes the
+/// check exhaustively verifiable: there is nothing here to under-enumerate the way a blacklist of
+/// "known dangerous characters" can be.
+///
+/// One consequence worth stating honestly: multibase's `u`-prefixed base64url form uses exactly
+/// this alphabet (`-` and `_` are what make base64*url*, unlike base64-standard's `+ /`, URL-safe),
+/// so a base64url string also passes. Passing this check is not a claim about which multibase form
+/// a string is — only that it is safe to interpolate.
+///
+/// The only constructor is [`Cid::parse`]; the inner field is private so that no caller — however
+/// indirect — can build a [`ComposeUri::Ipfs`] holding an unvalidated string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Cid(String);
+
+impl Cid {
+    /// Parse a CID, accepting only bytes that cannot alter the structure of a URL it is
+    /// interpolated into.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UriError::EmptyCid`] if `s` is empty, or [`UriError::InvalidCid`] if `s` contains
+    /// any byte outside `[A-Za-z0-9_-]`.
+    pub fn parse(s: &str) -> Result<Self, UriError> {
+        if s.is_empty() {
+            return Err(UriError::EmptyCid);
+        }
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(UriError::InvalidCid);
+        }
+        Ok(Self(s.to_owned()))
+    }
+
+    /// The CID's string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Cid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Where a compose document lives.
 ///
 /// Parsed rather than passed around as a string so that a caller cannot accidentally hand a
@@ -32,7 +94,7 @@ pub enum ComposeUri {
     ///
     /// The preferred form: content addressing means a wrong answer is detectable by hashing,
     /// independently of who served it.
-    Ipfs(String),
+    Ipfs(Cid),
     /// An absolute `http`/`https` URL.
     ///
     /// Supported because a manifest may point anywhere, but it carries no content-addressing
@@ -55,14 +117,12 @@ impl ComposeUri {
     ///
     /// # Errors
     ///
-    /// Returns [`UriError`] for an empty CID, an unsupported scheme, or a missing scheme.
+    /// Returns [`UriError`] for an empty CID, a CID containing a character unsafe to interpolate,
+    /// an unsupported scheme, or a missing scheme.
     pub fn parse(s: &str) -> Result<Self, UriError> {
         let s = s.trim();
         if let Some(cid) = s.strip_prefix("ipfs://") {
-            if cid.is_empty() {
-                return Err(UriError::EmptyCid);
-            }
-            return Ok(Self::Ipfs(cid.to_owned()));
+            return Cid::parse(cid).map(Self::Ipfs);
         }
         if s.starts_with("https://") || s.starts_with("http://") {
             return Ok(Self::Http(s.to_owned()));
@@ -77,7 +137,7 @@ impl ComposeUri {
     #[must_use]
     pub fn cid(&self) -> Option<&str> {
         match self {
-            Self::Ipfs(cid) => Some(cid),
+            Self::Ipfs(cid) => Some(cid.as_str()),
             Self::Http(_) => None,
         }
     }
@@ -99,6 +159,12 @@ pub enum UriError {
     /// `ipfs://` with nothing after it.
     #[error("ipfs:// URI has an empty CID")]
     EmptyCid,
+    /// A CID containing a byte that could alter the structure of a URL it is interpolated into.
+    ///
+    /// Rejected before it can reach a gateway path (`/ipfs/<cid>`) or a Kubo query
+    /// (`?arg=<cid>`) — see [`Cid`] for exactly what is and is not allowed, and why.
+    #[error("ipfs:// CID contains a character unsafe to interpolate")]
+    InvalidCid,
     /// A scheme this crate does not retrieve.
     #[error("unsupported scheme `{0}`")]
     UnsupportedScheme(String),

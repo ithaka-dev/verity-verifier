@@ -16,6 +16,12 @@
 //! can withhold but not substitute. What it can still do is stall forever, or send a very large
 //! body, and the client has to survive both without the caller having to think about it.
 
+// Pre-existing gap, fixed in passing (VA-3): every item this file imports from `compose` —
+// `Gateway`, `HttpUrl`, `KuboRpc`, `Source` — is `#[cfg(feature = "fetch")]`, but this file carried
+// no matching guard. `compose_fetch.rs` has one; this one did not, so on a clean checkout `cargo
+// test` with `fetch` off (the default feature set, and `--features connect` alone) failed to
+// *compile* this test binary, unrelated to anything else in this change.
+#![cfg(feature = "fetch")]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -410,4 +416,115 @@ fn failures_are_not_cached() {
         "a failure must be retried, not served from cache"
     );
     assert!(cached.is_empty());
+}
+
+// — VA-3: redirects are not followed —
+//
+// Mirrors `connect::http`'s `a_redirect_to_another_host_is_not_followed`
+// (`crates/verity-verifier/src/connect/http.rs`). Before this change the compose `agent()` set no
+// redirect policy at all: a fake server recording whether it was contacted showed the current agent
+// *did* follow a 302 to a second host — that RED evidence is what these tests now pin as GREEN.
+
+/// Starts a single-shot server that records whether it was contacted at all (and the request line,
+/// for the CID tests below), then answers 200 with an empty body.
+fn serve_recording() -> (String, std::sync::Arc<std::sync::Mutex<Option<String>>>) {
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let slot = recorded.clone();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let request_line = request.lines().next().unwrap_or("").to_owned();
+            *slot.lock().expect("lock") = Some(request_line);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), recorded)
+}
+
+/// Server A always answers with a 302 pointing at `target`.
+fn serve_redirect_to(target: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let location = format!("{target}/ipfs/x");
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut scratch = [0u8; 1024];
+            let _ = stream.read(&mut scratch);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn a_redirect_is_not_followed_by_the_http_url_source() {
+    let (base_b, recorded_b) = serve_recording();
+    let base_a = serve_redirect_to(&base_b);
+    let uri = ComposeUri::parse(&format!("{base_a}/compose.json")).expect("uri");
+
+    // ureq only treats 4xx/5xx as an error, so a 302 comes back as `Ok` — its (empty) body then
+    // fails the hash check upstream, which is the caller's own concern, not this source's.
+    let result = HttpUrl::new().fetch(&uri);
+    assert!(
+        result.is_ok(),
+        "a 302 must come back as data rather than an error: {result:?}"
+    );
+
+    // `fetch` is synchronous: by the time it has returned, any redirect it was going to follow has
+    // already completed, so there is nothing to wait for here.
+    assert!(
+        recorded_b.lock().expect("lock").is_none(),
+        "the redirect target must never be contacted — following it would carry the request to a \
+         host nobody chose, before the hash check ever runs"
+    );
+}
+
+#[test]
+fn a_redirect_is_not_followed_by_the_gateway_source() {
+    let (base_b, recorded_b) = serve_recording();
+    let base_a = serve_redirect_to(&base_b);
+
+    let result = Gateway::new(base_a).fetch(&ipfs());
+    assert!(
+        result.is_ok(),
+        "a 302 must come back as data rather than an error: {result:?}"
+    );
+
+    // `fetch` is synchronous — see the note in the `HttpUrl` test above.
+    assert!(
+        recorded_b.lock().expect("lock").is_none(),
+        "the redirect target must never be contacted"
+    );
+}
+
+// — VA-3: a malformed CID never reaches the wire —
+//
+// `Cid::parse` (exercised more exhaustively in `compose_uri.rs`) already refuses these strings, so
+// `ComposeUri::Ipfs` can never be *constructed* with them — there is no `ComposeUri` value here to
+// pass to `Gateway`/`KuboRpc` at all. These two tests pin that the request-line-level RED evidence
+// gathered for `../admin` and `cid&timeout=0` during development is now unreachable by construction,
+// not merely intercepted downstream.
+
+#[test]
+fn a_traversal_cid_cannot_reach_the_gateway_because_it_cannot_be_parsed() {
+    assert_eq!(
+        ComposeUri::parse("ipfs://../admin"),
+        Err(verity_verifier::compose::UriError::InvalidCid)
+    );
+}
+
+#[test]
+fn a_query_injection_cid_cannot_reach_kubo_because_it_cannot_be_parsed() {
+    assert_eq!(
+        ComposeUri::parse("ipfs://cid&timeout=0"),
+        Err(verity_verifier::compose::UriError::InvalidCid)
+    );
 }

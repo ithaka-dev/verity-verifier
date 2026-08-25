@@ -122,6 +122,7 @@ ENDPOINT=crates/verity-verifier/src/endpoint.rs
 RATLS=crates/verity-verifier/src/ratls.rs
 TLS=crates/verity-verifier/src/connect/tls.rs
 CONNECT_HTTP=crates/verity-verifier/src/connect/http.rs
+COMPOSE_HTTP=crates/verity-verifier/src/compose/http.rs
 
 echo "— the binding (C6: licensed_composeHash == attested_composeHash) —"
 
@@ -371,6 +372,21 @@ mutate "$ENDPOINT" \
   'Ok(0) | Err(_) => return Err(EndpointError::BadPort { port: p.to_owned() }),' \
   'Err(_) => return Err(EndpointError::BadPort { port: p.to_owned() }),' \
   && run "port 0 accepted as a connectable port"
+
+echo
+echo "— compose retrieval (VA-3) —"
+#
+# Retrieval is outside the trust model — a wrong or hostile compose document is caught by the hash
+# check that runs after every fetch. This section is about the request-line-level side effects that
+# happen *before* that check: SSRF, injection, and traversal, which the hash check does nothing to
+# prevent.
+
+# The same reasoning as $CONNECT_HTTP's redirect mutant above, in the sibling agent that had no
+# redirect policy at all before VA-3. A content-addressed gateway has no legitimate reason to bounce
+# a fetch elsewhere; following one carries a pre-hash-check request into loopback/private space.
+mutate "$COMPOSE_HTTP" \
+  '        .max_redirects(0)' '        .max_redirects(10)' \
+  && run "the compose agent follows redirects away from a content-addressed source"
 
 echo
 echo "— known equivalent —"
