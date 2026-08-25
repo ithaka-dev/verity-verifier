@@ -644,12 +644,31 @@ impl Verdict {
     }
 
     /// The outcome of one check, if it was considered at all.
+    ///
+    /// **Non-pass dominates.** A check recorded more than once reports a non-`Passed` record in
+    /// preference to a `Passed` one, so a later `Failed`/`Skipped`/`Indeterminate` can never be
+    /// masked by an earlier `Passed`. This is what keeps `is_trustworthy()` coherent with
+    /// `failures()` and with an essential `Indeterminate` (ADR 0035 §2): a verdict cannot read
+    /// trustworthy while any essential also carries a refusal or an unestablished outcome.
+    /// Order-independent for the trust question — any non-pass sinks it regardless of order — and
+    /// inert for every single-record path, which is every production and wasm builder. It is
+    /// **not** order-independent for the specific value reported when a check carries two or more
+    /// *different* non-pass records (e.g. `Indeterminate` then `Skipped` returns the first of the
+    /// two); that case is unreachable on any real path — every `Check` is recorded exactly once —
+    /// and the trust answer is identical either way.
     #[must_use]
     pub fn outcome(&self, check: Check) -> Option<&Outcome> {
-        self.results
-            .iter()
-            .find(|(c, _)| *c == check)
-            .map(|(_, o)| o)
+        let mut passed: Option<&Outcome> = None;
+        for (c, o) in &self.results {
+            if *c != check {
+                continue;
+            }
+            if !o.passed() {
+                return Some(o); // first non-pass dominates
+            }
+            passed.get_or_insert(o); // hold the pass only until a non-pass appears
+        }
+        passed
     }
 
     /// Checks that failed.
@@ -779,16 +798,45 @@ impl Default for Verdict {
 /// same affordance without a TCP stack, and so the WASM bindings can adopt it later without a
 /// feature. It adds no dependency.
 ///
-/// # What it does not establish
+/// # What holding one proves — and only this
 ///
-/// That the evidence came from the connection you are using. Every essential check passing is a
-/// statement about the inputs it was given; [`crate::connect::connect_verified`] is what makes
-/// those inputs come from a handshake it performed itself.
+/// That the [`Verdict`] it wraps records [`Outcome::Passed`] for every essential check
+/// ([`Check::essential`]). It is a judgment about a transcript, nothing more.
+///
+/// # What it does NOT prove
+///
+/// - **That any check was actually performed against real evidence.** [`Verdict::new`] and
+///   [`Verdict::record`] are public and ungated — deliberately, so the WASM bindings can assemble
+///   a `Verdict` check-by-check across the crate boundary. A caller can equally well hand-assemble
+///   a `Verdict` of all-`Passed` records and wrap it; the wrapper reports what the transcript says,
+///   and the transcript is only as honest as whoever built it.
+/// - **That the evidence was genuine even when the transcript is genuine.** [`crate::verify::verify`]
+///   performs no I/O and trusts the `Evidence` it is handed, including the caller-supplied
+///   `peer_certificate`. A caller who feeds it a recorded quote plus a matching certificate gets a
+///   real, honestly-computed, all-`Passed` verdict about a connection they are not using. A
+///   `TrustworthyVerdict` minted from that verdict is indistinguishable, by anything this type
+///   exposes, from one about a live endpoint — hand-assembly is not the only route to a forged
+///   verdict, and this route runs through the crate's own, correctly-functioning checks.
+/// - **That the evidence came from a live connection, or from any connection at all.** A verdict
+///   about recorded evidence and a verdict about an endpoint you are talking to right now look
+///   identical here.
+/// - **That the inputs were not chosen by the caller.**
+///
+/// The only thing that binds a verdict to a connection the caller actually made is
+/// [`crate::connect::connect_verified`] / [`crate::connect::VerifiedClient`], whose constructor is
+/// private for exactly this reason — see its own doc. Treat a bare `TrustworthyVerdict` from an
+/// untrusted source as an unverified claim about a transcript; require a `VerifiedClient` wherever
+/// provenance matters.
 #[derive(Debug, Clone)]
 pub struct TrustworthyVerdict(Verdict);
 
 impl TrustworthyVerdict {
     /// Judge a verdict, and return it wrapped only if every essential check ran and passed.
+    ///
+    /// **This judges a transcript; it does not authenticate the transcript's origin.** See
+    /// [`TrustworthyVerdict`]'s "What it does NOT prove" — a hand-assembled or replayed-evidence
+    /// `Verdict` passes this exactly as a genuine one does. Only [`crate::connect::VerifiedClient`]
+    /// establishes that the evidence came from a connection the caller made.
     ///
     /// # Errors
     ///

@@ -25,9 +25,11 @@ fn all_essentials_pass() -> Verdict {
 
 /// Every essential check passing except `target`, which gets `outcome`.
 ///
-/// Built this way rather than by recording over a passing verdict, because `record` appends and
-/// `outcome` returns the first match — so a second record for the same check is silently ignored.
-/// See `recording_a_check_twice_keeps_the_first`.
+/// Built via a filtered fold, producing exactly one record per check, rather than by recording
+/// `outcome` over an already-passing verdict. Under non-pass-dominates either construction would
+/// resolve `outcome(target)` the same way (see
+/// `recording_a_check_twice_lets_a_later_non_pass_dominate`) — this form is kept because it leaves
+/// `results()` with one entry per check, which several tests below assert on directly.
 fn essentials_with(target: Check, outcome: &Outcome) -> Verdict {
     Check::essential().iter().fold(Verdict::new(), |v, c| {
         let o = if *c == target {
@@ -118,21 +120,31 @@ fn a_check_that_never_ran_appears_in_both() {
     );
 }
 
-/// **`record` appends; `outcome` reads the first.** So a check recorded twice keeps its original
-/// outcome and the second is silently dropped. No live caller does this — `verify` records each
-/// check exactly once — but the shape is a footgun worth pinning: a future branch that records a
-/// refusal over an earlier pass would have no effect, and nothing would say so.
+/// **`record` appends; `outcome` reports the dominant record.** A check recorded twice, once as
+/// `Passed` and once as a refusal, reports the refusal — the deliberate rewrite of this test.
 ///
-/// This test asserts the behaviour that exists, not the behaviour that is desirable. If the
-/// semantics are ever made last-wins, or duplicates rejected outright, this test should change with
-/// it — it is here so that change is deliberate rather than accidental.
+/// **This test used to assert the opposite** (first-wins, so the later refusal was silently
+/// dropped) and its own doc invited exactly this change: "if the semantics are ever made
+/// last-wins, or duplicates rejected outright, this test should change with it — it is here so
+/// that change is deliberate rather than accidental." VA-2 (audit VV-02) is that change: first-wins
+/// let a verdict read `is_trustworthy() == true` while `failures()` simultaneously listed a refusal
+/// for the same essential (see `a_later_failed_dominates_an_earlier_pass_for_the_same_essential`
+/// below), which is the contradiction non-pass-dominates exists to make structurally impossible.
+///
+/// The transcript-preserving half of the old test is unchanged: both records still survive in
+/// `results()`, and the failure is still visible via `failures()` — only which record `outcome()`
+/// selects as *the* answer has changed.
 #[test]
-fn recording_a_check_twice_keeps_the_first() {
+fn recording_a_check_twice_lets_a_later_non_pass_dominate() {
     let verdict = Verdict::new()
         .record(Check::MrConfigId, Outcome::Passed)
-        .record(Check::MrConfigId, failed("this is ignored"));
+        .record(Check::MrConfigId, failed("this is now dominant"));
 
-    assert_eq!(verdict.outcome(Check::MrConfigId), Some(&Outcome::Passed));
+    assert_eq!(
+        verdict.outcome(Check::MrConfigId),
+        Some(&failed("this is now dominant")),
+        "a later refusal dominates an earlier pass"
+    );
     assert_eq!(
         verdict.results().len(),
         2,
@@ -142,6 +154,108 @@ fn recording_a_check_twice_keeps_the_first() {
         !verdict.failures().is_empty(),
         "and the failure is still visible to anyone reading failures()"
     );
+}
+
+// — VA-2 (audit VV-02): non-pass dominates, closing the trustworthy/failures() contradiction —
+//
+// `outcome()` used to return the *first* recorded result for a check (`.find(...)`), while
+// `failures()` scanned every record. Appending a later `Failed`/`Indeterminate` for an
+// already-`Passed` essential left a verdict simultaneously `is_trustworthy() == true` (first-wins
+// saw the `Passed`) and listing that same check's refusal in `failures()` (the all-scan saw it).
+// These three tests pin the fix: a non-`Passed` record dominates, regardless of which side of a
+// `Passed` it was recorded on, so the two accessors can never disagree about the same check again.
+
+/// **T-A, the audit reproduction.** A `Failed` recorded after an otherwise-passing essential must
+/// sink `is_trustworthy()`, and `outcome()` must agree with `failures()` about what happened —
+/// never `is_trustworthy() == true` with a failure still listed for the same check.
+///
+/// Seen-to-fail (confirmed against the pre-fix `outcome()`, `.find`-based first-wins): `outcome()`
+/// returned `Passed`, `is_trustworthy()` was `true`, and `failures()` still listed the refusal —
+/// the exact contradiction this test exists to close.
+#[test]
+fn a_later_failed_dominates_an_earlier_pass_for_the_same_essential() {
+    let verdict = Check::essential()
+        .iter()
+        .fold(Verdict::new(), |v, c| v.record(*c, Outcome::Passed))
+        .record(Check::MrConfigId, failed("measured configuration drifted"));
+
+    assert_eq!(
+        verdict.outcome(Check::MrConfigId),
+        Some(&failed("measured configuration drifted")),
+        "the later refusal must be the reported outcome"
+    );
+    assert!(
+        !verdict.is_trustworthy(),
+        "a verdict cannot be trustworthy while an essential also carries a refusal"
+    );
+    assert!(
+        !verdict.failures().is_empty(),
+        "and failures() must agree that something failed"
+    );
+}
+
+/// **T-B, the ADR 0035 interaction.** The same contradiction, with the later record an essential
+/// `Indeterminate` rather than a `Failed`. ADR 0035 §2 makes an essential `Indeterminate` sink
+/// `is_trustworthy()`; first-wins let a `Passed` recorded first mask that entirely.
+///
+/// `failures()` correctly **excludes** `Indeterminate` (it is not a refusal — see
+/// `an_indeterminate_outcome_is_not_a_failure_and_is_not_passed` above), so the coherent shape here
+/// is "untrustworthy, with `outcome()` reporting `Indeterminate`, and no listed failure" — not "no
+/// failure, therefore trustworthy," which is what first-wins produced.
+///
+/// Seen-to-fail: under first-wins, `outcome()` returned `Passed` and `is_trustworthy()` was `true`
+/// — an unestablished essential read as satisfied.
+#[test]
+fn a_later_indeterminate_dominates_an_earlier_pass_for_an_essential() {
+    let verdict = Check::essential()
+        .iter()
+        .fold(Verdict::new(), |v, c| v.record(*c, Outcome::Passed))
+        .record(
+            Check::MrConfigId,
+            unestablished(
+                Unestablished::VerifierCannotJudge,
+                "build cannot judge this yet",
+            ),
+        );
+
+    assert!(matches!(
+        verdict.outcome(Check::MrConfigId),
+        Some(Outcome::Indeterminate { .. })
+    ));
+    assert!(
+        !verdict.is_trustworthy(),
+        "an essential Indeterminate must sink the verdict even when recorded after a Passed"
+    );
+    assert!(
+        verdict.failures().is_empty(),
+        "Indeterminate is not a failure — untrustworthy-without-a-listed-failure is the coherent \
+         shape here, not a contradiction"
+    );
+}
+
+/// **T-C, order-independence.** The trust question does not depend on which order a pass and a
+/// refusal were recorded in — both orderings dominate to the refusal and both read untrustworthy.
+/// Pins that the fix is genuinely non-pass-dominates, not merely "last write wins" (which would
+/// pass this test in only one of the two orderings).
+#[test]
+fn non_pass_dominates_regardless_of_recording_order() {
+    let failed_then_passed = Verdict::new()
+        .record(Check::MrConfigId, failed("refused first"))
+        .record(Check::MrConfigId, Outcome::Passed);
+    let passed_then_failed = Verdict::new()
+        .record(Check::MrConfigId, Outcome::Passed)
+        .record(Check::MrConfigId, failed("refused second"));
+
+    assert_eq!(
+        failed_then_passed.outcome(Check::MrConfigId),
+        Some(&failed("refused first"))
+    );
+    assert_eq!(
+        passed_then_failed.outcome(Check::MrConfigId),
+        Some(&failed("refused second"))
+    );
+    assert!(!failed_then_passed.is_trustworthy());
+    assert!(!passed_then_failed.is_trustworthy());
 }
 
 /// Every essential, one at a time, in each of the three states. The exhaustive version of the two

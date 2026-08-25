@@ -149,3 +149,47 @@ fn an_empty_verdict_is_refused_rather_than_vacuously_accepted() {
         .expect_err("nothing ran, so nothing passed");
     assert_eq!(returned.unrun_essentials(), Check::essential());
 }
+
+// — VA-2 (audit VV-02), Part 1: characterization, not a bug fix —
+//
+// `TrustworthyVerdict` is documented to be a *content-judgment* about a transcript, never proof of
+// where the evidence came from — see its "What holding one proves" / "What it does NOT prove" doc.
+// A hand-fabricated all-`Passed` verdict passing `check` is therefore **by design**, not a hole:
+// this test pins that documented behaviour so a future change cannot quietly alter it (e.g. by
+// adding a witness) without a test noticing, per the round-2 design decision that no witness or
+// sanctioned assembler is introduced.
+
+/// **T-D, characterization pin.** A hand-fabricated all-`Passed` verdict — built with no `verify()`
+/// call and no evidence examined — **does** produce `Ok(TrustworthyVerdict)`. This is the
+/// documented content-judgment guarantee working as designed, not the audit finding reopened: VA-2
+/// closes the `outcome()` first-wins/`failures()` contradiction (`Verdict::outcome`'s doc, exercised
+/// in `tests/verdict_semantics.rs`) and hardens this type's own contract (see the "What holding one
+/// proves" / "What it does NOT prove" doc above), but deliberately does not prevent construction —
+/// `Verdict::new`/`record` stay public because the WASM bindings assemble a verdict cross-crate
+/// through them.
+///
+/// The load-bearing half is what this wrapper **cannot** reach: there is no public path from a
+/// `TrustworthyVerdict`, fabricated or genuine, to a [`crate::connect::VerifiedClient`].
+/// `VerifiedClient`'s constructor is private, takes a `TrustworthyVerdict` produced from a live
+/// handshake, and is called from exactly one place — see its own doc. That is a compile-time,
+/// type-system property (no public constructor exists to call), not something a runtime assertion
+/// can meaningfully strengthen, so it is pinned here as a doc-invariant rather than as a second
+/// `#[test]` that would just restate "there is no such method" by failing to compile it.
+#[test]
+fn a_hand_fabricated_verdict_is_a_content_judgment_not_provenance() {
+    let fabricated = Check::essential()
+        .iter()
+        .fold(Verdict::new(), |v, c| v.record(*c, Outcome::Passed));
+
+    let trustworthy = TrustworthyVerdict::check(fabricated)
+        .expect("by design: a content-judgment about a transcript, not proof of its origin");
+
+    assert!(
+        trustworthy.verdict().is_trustworthy(),
+        "the wrapper reports what the transcript says"
+    );
+    // Doc-invariant, not a runtime check: `crate::connect::VerifiedClient` has no public
+    // constructor at all, so there is no expression `trustworthy` (or any `TrustworthyVerdict`)
+    // could be passed to here that would compile into one. See `VerifiedClient`'s own doc:
+    // "There is no public constructor, and none obtainable from an untrustworthy verdict."
+}
