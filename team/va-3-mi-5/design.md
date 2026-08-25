@@ -543,3 +543,35 @@ traversal/redirect scope, and are recorded here as follow-ups rather than fixed 
   itself worth naming as a small gate-integrity issue on its own.
 
 Both are being carried to the board by the facilitator rather than actioned here.
+
+## 11. Implementation notes — Change 2 (va3-developer)
+
+No forced deviations. `Fallback<S>` and the `impl<S: Source + ?Sized> Source for Box<S>` blanket
+impl landed in `compose.rs` exactly as specified in §4.2, with the AMEND from §8
+(`Fallback::new(first: S, rest: Vec<S>)`, no `Result`) as agreed. Scope held: nothing in
+`compose/http.rs` was touched (`Fallback` wraps a `Source`, it doesn't change how any `Source`
+fetches), and the file cache stays deferred per §4.1/§4.3 — not built.
+
+Tests live in a new, deliberately **ungated** `tests/compose_fallback.rs`, mirroring
+`dispositions.rs`'s own reasoning: `Fallback` is generic over any `Source` and needs no network, so
+gating its tests behind `fetch` would mean the multi-gateway acceptance criteria don't run on a
+plain `cargo test`. A local `Scripted` stub (success/failure + a call counter) stands in for a real
+gateway.
+
+Seen-to-fail: wrote `tests/compose_fallback.rs` referencing `Fallback` before it existed in
+`compose.rs`; `cargo test -p verity-verifier --test compose_fallback` failed to compile
+(`E0432: unresolved import`), confirming there was nothing to accidentally already satisfy the test.
+After implementing, the same file is green (5/5): a working first source is used and the rest are
+never touched (call-count asserted at 0); a dead first source falls through to a live second (both
+call-counts at 1, in order); three sources fall through in order before a live third; all-down
+returns an error whose `Unestablished::from(&err)` is `RetrievalFailed` — the *same* mapping
+`dispositions.rs` already pins exhaustively, not a new one; and a single-source `Fallback` behaves
+like the source alone (the degenerate case the non-`Result` constructor makes trivially
+constructible, unlike an empty-`Vec` design would have needed a test for).
+
+No new dependencies (`git diff --stat` on both `Cargo.toml`s and `Cargo.lock` is empty). Gates —
+`cargo fmt --check`, workspace `cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo doc --no-deps`, `cargo test --all-features`, `cargo test --features connect`, and
+`cargo test --no-default-features --features fetch` scoped to the lib plus
+`compose_uri`/`compose_http`/`compose_fallback`/`dispositions` (the same pre-existing, out-of-scope
+gap named in §9 for the other five integration test files) — all green.

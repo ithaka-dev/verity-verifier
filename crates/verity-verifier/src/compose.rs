@@ -19,6 +19,15 @@
 //! Retrieval is deliberately **not** part of the trust model. Because the document is
 //! content-addressed and its hash is committed on-chain, a wrong or hostile answer is detectable —
 //! so *where* it came from does not need to be trusted, only *what* came back.
+//!
+//! # Synchronous, deliberately
+//!
+//! [`Source::fetch`] is plain, synchronous `&self` → `Result` — no `async`, matching the crate as a
+//! whole (the workspace `Cargo.toml` has the full rationale for the `fetch` feature's HTTP client).
+//! That keeps a caller with no async runtime at all — a WASM host, an offline audit tool — able to
+//! retrieve a document without the crate imposing one. One consequence for a combinator like
+//! [`Fallback`]: trying several sources happens in sequence, never concurrently, which is why its
+//! own docs treat their timeouts as additive rather than overlapping.
 
 use core::fmt;
 
@@ -244,6 +253,15 @@ pub trait Source {
     fn fetch(&self, uri: &ComposeUri) -> Result<Vec<u8>, FetchError>;
 }
 
+impl<S: Source + ?Sized> Source for Box<S> {
+    /// Lets a heterogeneous chain — e.g. `Fallback<Box<dyn Source>>` — mix source kinds (an IPFS
+    /// gateway alongside a Kubo RPC node, say) that a homogeneous [`Fallback<S>`](Fallback) cannot
+    /// express.
+    fn fetch(&self, uri: &ComposeUri) -> Result<Vec<u8>, FetchError> {
+        (**self).fetch(uri)
+    }
+}
+
 /// A compose document is small. Anything much larger is not one.
 pub const DEFAULT_SIZE_LIMIT: usize = 1024 * 1024;
 
@@ -360,5 +378,73 @@ impl<S: Source> Source for Cached<S> {
             entries.insert(uri.clone(), bytes.clone());
         }
         Ok(bytes)
+    }
+}
+
+/// Tries each source in order; the first success wins, and a miss falls through to the next.
+///
+/// Public gateways are flaky. A single reachable source is enough to establish a verdict, because
+/// the compose document is the same content-addressed object no matter which source served it —
+/// trying the next source on a miss costs nothing but time.
+///
+/// # Why a bad source in the chain cannot cause a wrong answer
+///
+/// Same argument as [`Cached`]: the hash check runs on whatever bytes eventually come back,
+/// regardless of which source in the chain produced them. A misconfigured, unreachable, or
+/// outright hostile entry can therefore only ever make `fetch` slower, or — if every entry is bad —
+/// cause a refusal. It can never manufacture a spurious success, because nothing here is trusted
+/// any more than a lone `Source` already is.
+///
+/// # Only all-down surfaces as a failure
+///
+/// If every source errors, [`Source::fetch`] returns the last error encountered. Like every
+/// [`FetchError`], that error maps to [`crate::verdict::Unestablished::RetrievalFailed`] through the
+/// existing `From<&FetchError>` impl above — reused here, not forked. At the verdict level, a
+/// `Fallback` where every source is down is indistinguishable from any single source being down.
+///
+/// # Bounded duration is additive, not amortized
+///
+/// Each inner source already carries its own timeouts. A chain of `N` sources that are all
+/// unreachable costs up to the *sum* of every source's timeout, not just one — retrieval here is
+/// deliberately synchronous (see the module docs), and a compose document is a few kilobytes, not
+/// something worth fanning a request out for. Keep chains short (two or three entries) and consider
+/// tightening a source's own timeout when it is used behind a `Fallback`.
+#[derive(Debug)]
+pub struct Fallback<S> {
+    first: S,
+    rest: Vec<S>,
+}
+
+impl<S> Fallback<S> {
+    /// A fallback chain that tries `first`, then each of `rest` in order.
+    ///
+    /// Takes a guaranteed first source rather than a `Vec` behind a fallible constructor: an empty
+    /// chain is a caller mistake, not a retrieval outcome it makes sense to hand back as a
+    /// [`FetchError`] — so, as with [`Cid`], the illegal state is made unrepresentable instead of
+    /// checked for at construction.
+    #[must_use]
+    pub fn new(first: S, rest: Vec<S>) -> Self {
+        Self { first, rest }
+    }
+}
+
+impl<S: Source> Source for Fallback<S> {
+    fn fetch(&self, uri: &ComposeUri) -> Result<Vec<u8>, FetchError> {
+        // No `FetchError` variant is special-cased — in particular, `Unsupported` (the wrong kind
+        // of `ComposeUri` for a given source) is treated exactly like any other miss and falls
+        // through to the next source. That matters for a heterogeneous chain
+        // (`Fallback<Box<dyn Source>>`) mixing sources that each only handle one URI kind.
+        let first = self.first.fetch(uri);
+        if first.is_ok() {
+            return first;
+        }
+        let mut last = first;
+        for source in &self.rest {
+            last = source.fetch(uri);
+            if last.is_ok() {
+                return last;
+            }
+        }
+        last
     }
 }
