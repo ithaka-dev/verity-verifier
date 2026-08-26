@@ -26,7 +26,8 @@
 # EQUIVALENT with a reason — a mutant that cannot change observable behaviour is not a gap.
 #
 #   ./script/mutate.sh              # the whole suite — this is the score that counts
-#   ./script/mutate.sh --quick      # skips the slow feature-gated suites
+#   ./script/mutate.sh --quick      # core mutants only; explicitly SKIPS the feature-gated ones
+#                                   # (connect/fetch) — run the full suite to score those
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,8 +35,19 @@ cd "$(dirname "$0")/.."
 # An array, not a string. Next door, `forge test $QUICK` word-split *and* glob-expanded into two
 # paths, forge rejected its own command line, and the non-zero exit was counted as a kill — every
 # mutant "died" without a single test running. The same mistake is one interpolation away here.
+#
+# `--quick` drops `--all-features`, so the crate builds with default features (`attest`) only. The
+# consequence is the whole point of the flag — the slow `connect`/`fetch` deps (ring, rustls, ureq)
+# are never compiled — but it has a trap: a mutant on a file those features gate away is applied to
+# source the compiler never sees, so `cargo test` passes and the mutant reads as SURVIVED. That is a
+# *false* gap: the mutant is unscored here, not unguarded. A mutant that needs a non-default feature
+# therefore declares it (the 2nd arg to `run`), and under `--quick` it is skipped out loud rather
+# than mis-scored — the full run is where it counts. (Before this was fixed, `--quick` could not even
+# establish a baseline: the connect/attest test files were unguarded and failed to compile under
+# default features. That is the sibling VA-3 follow-up; both had to land together.)
 CARGO_ARGS=(--all-features)
-[ "${1:-}" = "--quick" ] && CARGO_ARGS=()
+QUICK=0
+[ "${1:-}" = "--quick" ] && { CARGO_ARGS=(); QUICK=1; }
 
 backup=$(mktemp -d)
 cp -R crates "$backup/"
@@ -45,7 +57,9 @@ trap 'restore; rm -rf "$backup"' EXIT
 killed=0
 survived=0
 equivalent=0
+skipped=0
 declare -a survivors=()
+declare -a skips=()
 
 # A mutant that fails to apply is worse than a missing one: it leaves the score looking complete
 # while one behaviour went unchecked. `set -e` is off so results can be tallied, so this exits
@@ -69,6 +83,19 @@ PY
 
 run() {
   local name="$1"
+  # An optional 2nd arg names a cargo feature this mutant needs to be *scored*: it lives on a file
+  # gated behind that feature. Under `--quick` (default features only) such a file is not compiled,
+  # so the mutation is inert and `cargo test` would pass — reporting SURVIVED for a mutant that was
+  # never actually run. Skip it out loud instead, and count it as skipped, not survived, so the
+  # score and the exit code both stay honest. The full run (no `--quick`) ignores this and scores it.
+  local needs="${2:-}"
+  if [ "$QUICK" = 1 ] && [ -n "$needs" ]; then
+    printf '  \033[2mskipped\033[0m   %s \033[2m(feature-gated: needs --features %s; scored only in the full run)\033[0m\n' "$name" "$needs"
+    skips+=("$name (needs --features $needs)")
+    skipped=$((skipped + 1))
+    restore
+    return
+  fi
   # A mutant that does not compile is still killed — the compiler is part of the suite, and a
   # loosening the type system rejects is a loosening that cannot ship. Reported separately so the
   # score is not quietly inflated by mutants that never ran a test.
@@ -292,7 +319,7 @@ mutate "$TLS" \
         )' \
   '        let _ = (message, cert, dss);
         Ok(HandshakeSignatureValid::assertion())' \
-  && run "TLS 1.3 handshake signatures asserted instead of verified"
+  && run "TLS 1.3 handshake signatures asserted instead of verified" connect
 
 # The same edit on the version a local client and server do NOT negotiate by default. Without
 # `the_same_replay_over_tls12_also_fails_the_handshake` pinning a TLS 1.2 server, this mutant changes
@@ -306,7 +333,7 @@ mutate "$TLS" \
         )' \
   '        let _ = (message, cert, dss);
         Ok(HandshakeSignatureValid::assertion())' \
-  && run "TLS 1.2 handshake signatures asserted instead of verified"
+  && run "TLS 1.2 handshake signatures asserted instead of verified" connect
 
 # The structural gate. `VerifiedClient` has no constructor that does not pass through here, so this
 # single edit is what would hand a client out on a verdict that failed an essential check — the
@@ -325,7 +352,7 @@ mutate "$CONNECT_HTTP" \
             })?;' \
   '        let verdict = TrustworthyVerdict::check(verdict)
             .unwrap_or_else(|v| TrustworthyVerdict::check(v).unwrap_or_else(|_| unreachable!()));' \
-  && run "the post-verify guard removed from the connector"
+  && run "the post-verify guard removed from the connector" connect
 
 # The endpoint form dStack's own API advertises. Classifying the terminating host as passthrough
 # means `connect_verified` dials it and reports a bare channel-binding mismatch — the refusal that
@@ -352,7 +379,7 @@ mutate "$RATLS" \
 # `VerifiedClient` — a verdict about one endpoint attached to an answer from another.
 mutate "$CONNECT_HTTP" \
   '        .max_redirects(0)' '        .max_redirects(10)' \
-  && run "redirects followed away from the verified peer"
+  && run "redirects followed away from the verified peer" connect
 
 # **The deadline, which was a defect before it was a test.** A per-socket read timeout bounds a peer
 # that says nothing; it does not bound one that says something every half-timeout, because
@@ -363,7 +390,7 @@ mutate "$CONNECT_HTTP" \
 mutate "$TLS" \
   '.checked_duration_since(Instant::now())' \
   '.checked_duration_since(Instant::now() - Duration::from_secs(3600))' \
-  && run "the handshake deadline never counts down, so each read gets the whole budget"
+  && run "the handshake deadline never counts down, so each read gets the whole budget" connect
 
 # Port 0 parses as a `u16` and names nothing to connect to. `Ok(0) | Err(_)` share a source line, so
 # per-line coverage cannot tell whether both patterns are exercised — the exact "coverage cannot tell
@@ -386,7 +413,7 @@ echo "— compose retrieval (VA-3) —"
 # a fetch elsewhere; following one carries a pre-hash-check request into loopback/private space.
 mutate "$COMPOSE_HTTP" \
   '        .max_redirects(0)' '        .max_redirects(10)' \
-  && run "the compose agent follows redirects away from a content-addressed source"
+  && run "the compose agent follows redirects away from a content-addressed source" fetch
 
 echo
 echo "— known equivalent —"
@@ -425,7 +452,15 @@ echo "            remove it and every request fails, which is loud but is not a 
 
 echo
 total=$((killed + survived))
-echo "score: $killed/$total killed, $equivalent equivalent"
+skipnote=""
+[ "$skipped" -gt 0 ] && skipnote=", $skipped skipped (feature-gated — run the full suite)"
+echo "score: $killed/$total killed, $equivalent equivalent$skipnote"
+
+if [ "$skipped" -gt 0 ]; then
+  echo
+  echo "skipped here, scored only in the full run (\`./script/mutate.sh\` with no --quick):"
+  for s in "${skips[@]}"; do echo "  - $s"; done
+fi
 
 if [ "$survived" -gt 0 ]; then
   echo
@@ -436,4 +471,11 @@ if [ "$survived" -gt 0 ]; then
   exit 1
 fi
 
-echo "every mutant was caught."
+# A skip is not a pass. Under --quick the exit stays 0 (the skipped mutants are covered by the full
+# run), but say plainly that this was a partial score so a green --quick is never mistaken for the
+# full guarantee.
+if [ "$skipped" -gt 0 ]; then
+  echo "every mutant that ran was caught; $skipped feature-gated mutant(s) were skipped — the full run scores those."
+else
+  echo "every mutant was caught."
+fi
