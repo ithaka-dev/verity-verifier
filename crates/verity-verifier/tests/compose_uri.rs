@@ -4,7 +4,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use proptest::prelude::*;
-use verity_verifier::compose::{Cid, ComposeUri, UriError};
+use verity_verifier::compose::{Cid, ComposeUri, ComposeUrl, UriError};
 
 #[test]
 fn parses_ipfs() {
@@ -127,6 +127,89 @@ fn accepts_cids_from_every_common_multibase_form_ipfs_actually_uses() {
     }
 }
 
+// — VA-3 follow-up: `ComposeUri::Http` closes the same asymmetry `Cid` closed for `Ipfs` —
+//
+// Seen-to-fail evidence (verified against `529deda`, before `ComposeUrl` existed): the enum's own
+// docs claim a caller "cannot accidentally hand a gateway an arbitrary URL", but
+// `ComposeUri::Http("file:///etc/passwd".into())` compiled and ran clean — confirmed empirically as
+// a scratch test against the unpatched tree (`1 passed; 0 failed`), with nothing anywhere in the
+// path rejecting it. That is RED against the invariant the type claims for itself.
+//
+// No `compile_fail`/trybuild test asserts the fix, for the same reason none exists for `Cid`
+// above: Rust has no per-field visibility on an enum tuple variant, so wrapping the field in a
+// newtype whose only public constructor is `ComposeUrl::parse` is not one enforcement mechanism
+// among several — it is the only one, and it holds at the module boundary for the whole crate, not
+// just for a test file. `ComposeUri::Http(ComposeUrl)` no longer compiles from anything but
+// `ComposeUri::parse` (or `ComposeUrl::parse(..).map(ComposeUri::Http)`), because `ComposeUrl`'s
+// inner `String` is private and it derives no `From`/`FromStr`/serde impl. The tests below pin the
+// constructor's behavior, which is the only place left to test.
+
+#[test]
+fn refuses_a_bad_http_scheme() {
+    assert_eq!(
+        ComposeUrl::parse("file:///etc/passwd"),
+        Err(UriError::UnsupportedScheme("file".to_owned()))
+    );
+}
+
+#[test]
+fn refuses_a_bare_http_string() {
+    assert_eq!(
+        ComposeUrl::parse("app-compose.json"),
+        Err(UriError::NoScheme)
+    );
+}
+
+#[test]
+fn accepts_both_http_schemes_verbatim() {
+    for s in [
+        "http://example.invalid/c.json",
+        "https://example.invalid/c.json",
+    ] {
+        let url = ComposeUrl::parse(s).expect("valid");
+        assert_eq!(
+            url.as_str(),
+            s,
+            "the URL is fetched verbatim, not normalized"
+        );
+    }
+}
+
+#[test]
+fn compose_uri_parse_and_compose_url_parse_never_disagree() {
+    // The VA-3 finding-2 no-drift lesson made testable: `ComposeUri::parse`'s http(s) branch does
+    // nothing but hand the trimmed string to `ComposeUrl::parse` and wrap the result, so the two
+    // must agree on the scheme-validity verdict for every input — there is exactly one definition of
+    // "a valid Http URL scheme", not two that could quietly diverge.
+    //
+    // Trimming itself is NOT part of what is shared: `ComposeUri::parse` trims before calling
+    // `ComposeUrl::parse` (see the latter's docs), so this comparison mirrors that by trimming on
+    // both sides (`s.trim()` below) rather than asserting `ComposeUrl::parse(s)` directly equals
+    // `ComposeUri::parse(s)`'s result — those two *do* diverge for a padded string
+    // (`ComposeUrl::parse(" http://x ")` rejects it as `UnsupportedScheme(" http")`, since it does no
+    // trimming of its own). The whitespace-padded vector below still agrees once the shared trim is
+    // applied on both sides, which is the property this test actually pins.
+    for s in [
+        "http://example.invalid/c.json",
+        "https://example.invalid/c.json",
+        "file:///etc/passwd",
+        "app-compose.json",
+        "",
+        "ftp://example.invalid/c.json",
+        "  http://example.invalid/c.json  ",
+    ] {
+        let wrapped_in_http_variant = ComposeUri::parse(s).ok().and_then(|uri| match uri {
+            ComposeUri::Http(url) => Some(url),
+            ComposeUri::Ipfs(_) => None,
+        });
+        let parsed_directly = ComposeUrl::parse(s.trim()).ok();
+        assert_eq!(
+            wrapped_in_http_variant, parsed_directly,
+            "diverged on {s:?}"
+        );
+    }
+}
+
 proptest! {
     /// Any string containing a byte outside `[A-Za-z0-9_-]` is rejected — the allowlist covers
     /// every disallowed byte, not just the ones named above.
@@ -150,5 +233,22 @@ proptest! {
     fn any_allowed_string_round_trips(s in "[A-Za-z0-9_-]{1,64}") {
         let cid = Cid::parse(&s).expect("every byte is allowed");
         prop_assert_eq!(cid.as_str(), s);
+    }
+
+    /// The universal form of `compose_uri_parse_and_compose_url_parse_never_disagree`: for any
+    /// string at all, `ComposeUri::parse`'s http branch and a direct `ComposeUrl::parse` call agree
+    /// on the scheme-validity verdict once both are compared post-trim — not just the six fixed
+    /// vectors above. As with that test, this is a claim about *scheme validity*, not about
+    /// whitespace handling: `ComposeUrl::parse` does no trimming of its own (see its docs), so this
+    /// trims on both sides to compare like for like, mirroring what `ComposeUri::parse` actually
+    /// hands the constructor.
+    #[test]
+    fn compose_uri_parse_and_compose_url_parse_never_disagree_for_any_string(s in ".{0,64}") {
+        let wrapped_in_http_variant = ComposeUri::parse(&s).ok().and_then(|uri| match uri {
+            ComposeUri::Http(url) => Some(url),
+            ComposeUri::Ipfs(_) => None,
+        });
+        let parsed_directly = ComposeUrl::parse(s.trim()).ok();
+        prop_assert_eq!(wrapped_in_http_variant, parsed_directly);
     }
 }

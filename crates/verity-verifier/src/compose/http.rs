@@ -148,7 +148,7 @@ impl Source for Gateway {
             // did not ask for; refusing keeps the two paths distinguishable.
             ComposeUri::Http(url) => Err(FetchError::Unsupported {
                 source_kind: "Gateway",
-                uri: url.clone(),
+                uri: url.to_string(),
             }),
         }
     }
@@ -196,7 +196,7 @@ impl Source for KuboRpc {
             ),
             ComposeUri::Http(url) => Err(FetchError::Unsupported {
                 source_kind: "KuboRpc",
-                uri: url.clone(),
+                uri: url.to_string(),
             }),
         }
     }
@@ -256,7 +256,7 @@ impl HttpUrl {
 impl Source for HttpUrl {
     fn fetch(&self, uri: &ComposeUri) -> Result<Vec<u8>, FetchError> {
         match uri {
-            ComposeUri::Http(url) => get(url, self.limit),
+            ComposeUri::Http(url) => get(url.as_str(), self.limit),
             ComposeUri::Ipfs(cid) => Err(FetchError::Unsupported {
                 source_kind: "HttpUrl",
                 uri: format!("ipfs://{cid}"),

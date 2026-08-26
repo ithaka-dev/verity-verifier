@@ -93,6 +93,80 @@ impl fmt::Display for Cid {
     }
 }
 
+/// A parsed `http`/`https` compose URL.
+///
+/// The invariant is **scheme-validity, and only that**: the inner string begins with `http://` or
+/// `https://`. It is deliberately *not* a claim about the host, port, path, or reachability, and
+/// carries **no** content-addressing guarantee — unlike [`Cid`], the value is fetched verbatim
+/// (never interpolated into a larger URL), so there is no injection surface to defend and no host
+/// policy to enforce here. Whether an embedder should point retrieval at a given URL, and any
+/// private-range concern, is the embedder's decision (see `HttpUrl`'s retrieval-policy docs);
+/// retrieval is outside the trust model and the hash check against the licensed `composeHash` is
+/// authoritative regardless of what comes back.
+///
+/// The only constructor is [`ComposeUrl::parse`]; the inner field is private so that no caller can
+/// build a [`ComposeUri::Http`] holding a string that did not pass the scheme check — the same
+/// "parsed, not a raw string" guarantee [`Cid`] gives the `Ipfs` arm. Rust has no per-field
+/// visibility on an enum tuple variant, so this newtype is not one option among several for
+/// achieving that guarantee — it is the only one today. That "today" is doing real work: nothing
+/// stops a *future* `From<String>`, `FromStr`, or derived `Deserialize` impl from reopening the same
+/// bypass by a different door, which is why the example below is kept as a compiled regression
+/// guard rather than only a prose claim.
+///
+/// # Examples
+///
+/// The private field means a raw tuple literal cannot be built even from within this crate's own
+/// dependents:
+///
+/// ```compile_fail
+/// use verity_verifier::compose::ComposeUri;
+///
+/// let bad = ComposeUri::Http("file:///etc/passwd".to_owned());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ComposeUrl(String);
+
+impl ComposeUrl {
+    /// Parse an `http`/`https` URL, accepting only the two schemes this crate retrieves.
+    ///
+    /// Performs **no** host, port, path, or private-range validation — see the type docs for why
+    /// that is deliberate, not an oversight.
+    ///
+    /// Performs **no** trimming of its own. [`ComposeUri::parse`] trims before handing this
+    /// constructor a string, so a whitespace-padded URL that succeeds through `ComposeUri::parse`
+    /// (e.g. `" http://x "`) is rejected here if called directly with the padding still attached —
+    /// trimming is the caller's step, not this constructor's. What the two entry points share is the
+    /// scheme-validity verdict on a given string, not whitespace handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UriError::UnsupportedScheme`] if `s` carries a scheme other than `http`/`https`,
+    /// or [`UriError::NoScheme`] if it carries none. Shares its verdict vocabulary with
+    /// [`ComposeUri::parse`], which routes through this constructor, so the two cannot disagree
+    /// about whether a given (already-trimmed) string has a valid `http`/`https` scheme.
+    pub fn parse(s: &str) -> Result<Self, UriError> {
+        if s.starts_with("https://") || s.starts_with("http://") {
+            return Ok(Self(s.to_owned()));
+        }
+        match s.split_once("://") {
+            Some((scheme, _)) => Err(UriError::UnsupportedScheme(scheme.to_owned())),
+            None => Err(UriError::NoScheme),
+        }
+    }
+
+    /// The URL's string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ComposeUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Where a compose document lives.
 ///
 /// Parsed rather than passed around as a string so that a caller cannot accidentally hand a
@@ -108,7 +182,7 @@ pub enum ComposeUri {
     ///
     /// Supported because a manifest may point anywhere, but it carries no content-addressing
     /// guarantee of its own — the hash check is doing all the work.
-    Http(String),
+    Http(ComposeUrl),
 }
 
 impl ComposeUri {
@@ -133,13 +207,11 @@ impl ComposeUri {
         if let Some(cid) = s.strip_prefix("ipfs://") {
             return Cid::parse(cid).map(Self::Ipfs);
         }
-        if s.starts_with("https://") || s.starts_with("http://") {
-            return Ok(Self::Http(s.to_owned()));
-        }
-        match s.split_once("://") {
-            Some((scheme, _)) => Err(UriError::UnsupportedScheme(scheme.to_owned())),
-            None => Err(UriError::NoScheme),
-        }
+        // The http(s):// decision lives in ONE place. `ComposeUri::parse` does not branch on the
+        // prefix itself — it hands the string to `ComposeUrl::parse` and lets the single definition
+        // decide. This is the VA-3 finding-2 no-drift lesson applied: two copies of "what is a valid
+        // http URL" cannot disagree because there is only one.
+        ComposeUrl::parse(s).map(Self::Http)
     }
 
     /// The content identifier, when this is an `ipfs://` URI.
@@ -156,7 +228,7 @@ impl fmt::Display for ComposeUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ipfs(cid) => write!(f, "ipfs://{cid}"),
-            Self::Http(url) => f.write_str(url),
+            Self::Http(url) => f.write_str(url.as_str()),
         }
     }
 }
