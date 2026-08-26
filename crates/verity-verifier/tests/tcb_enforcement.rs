@@ -14,6 +14,12 @@
 //! `verified_transport.rs` already do that. This file exists to fail to compile, not to fail at
 //! runtime.
 
+// Whole-file feature guard: this arity guard calls `connect`/`attest`/`verify` APIs cfg-gated away
+// when `connect` is off, so without it the file breaks `--no-default-features` and `--features
+// fetch`-only builds. `connect` implies `attest`. The guard it provides is meaningful only when
+// those APIs exist; under `--all-features` (CI) it compiles and does its job. Mirrors
+// compose_{fetch,http}.rs.
+#![cfg(feature = "connect")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use verity_verifier::attest::Collateral;

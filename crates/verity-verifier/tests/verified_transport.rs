@@ -27,6 +27,11 @@
 //! `::1` first while `TcpListener::bind("127.0.0.1:0")` binds IPv4, so a `localhost` dial gets
 //! `ECONNREFUSED` — and a test expecting a refusal then passes without a connection ever happening.
 
+// Whole-file feature guard: this suite drives `connect_verified` and uses `connect`/`attest`/
+// `verify` APIs cfg-gated away when `connect` is off, so without it the file breaks
+// `--no-default-features` and `--features fetch`-only builds. `connect` implies `attest`. Mirrors
+// the guard on compose_{fetch,http}.rs. Under `--all-features` it still compiles and runs.
+#![cfg(feature = "connect")]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,

@@ -1,5 +1,9 @@
 //! Reference data (V-09/V-12) and verdict semantics (V-10/V-11).
 
+// Whole-file feature guard: this suite uses `attest`/`verify` APIs that are cfg-gated away when
+// `attest` is off, so without it the file breaks `--no-default-features` builds. Mirrors the guard
+// on compose_{fetch,http}.rs. Under `--all-features` it still compiles and runs.
+#![cfg(feature = "attest")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use verity_verifier::attest::Collateral;

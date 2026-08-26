@@ -17,6 +17,10 @@
 //! enclave's quote presented over somebody else's connection, and dStack's gateway terminating TLS
 //! with a certificate that ordinary TLS verification *accepts*.
 
+// Whole-file feature guard: this suite uses `attest`/`verify` APIs that are cfg-gated away when
+// `attest` is off, so without it the file breaks `--no-default-features` builds. Mirrors the guard
+// on compose_{fetch,http}.rs. Under `--all-features` it still compiles and runs.
+#![cfg(feature = "attest")]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,

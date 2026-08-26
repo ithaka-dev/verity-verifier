@@ -11,6 +11,11 @@
 //! agree), and its behavioural tests (the T-01 suite this file used to carry) live in
 //! `src/verdict.rs`'s `tcb_acceptance_tests` module, alongside the function they test.
 
+// Whole-file feature guard: this suite uses `attest`/`verify` APIs that are cfg-gated away when
+// `attest` is off, so without it the file breaks `--no-default-features` builds (and any feature
+// combination excluding `attest`). Mirrors the guard on compose_{fetch,http}.rs. Under
+// `--all-features` — CI's run and the default local run — it still compiles and runs.
+#![cfg(feature = "attest")]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
