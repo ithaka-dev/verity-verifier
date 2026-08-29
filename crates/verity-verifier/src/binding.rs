@@ -70,11 +70,12 @@ impl ComposeHash {
             return Err(HashParseError::WrongLength { got: s.len() });
         }
         let mut bytes = [0u8; COMPOSE_HASH_LEN];
-        for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
-            let (hi, lo) = match chunk {
-                [h, l] => (*h, *l),
-                _ => return Err(HashParseError::NotHex),
-            };
+        // `as_chunks` rather than `chunks_exact` (clippy 1.98's `chunks_exact_to_as_chunks`): the
+        // length check above guarantees an even byte count, so the ignored remainder is always
+        // empty either way — but the array pattern is irrefutable, where the slice match needed a
+        // defensive arm for a length that cannot occur.
+        for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let [hi, lo] = *chunk;
             let hi = char::from(hi).to_digit(16).ok_or(HashParseError::NotHex)?;
             let lo = char::from(lo).to_digit(16).ok_or(HashParseError::NotHex)?;
             let byte = u8::try_from((hi << 4) | lo).map_err(|_| HashParseError::NotHex)?;

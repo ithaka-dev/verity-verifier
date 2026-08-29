@@ -329,7 +329,9 @@ fn decode(hex: &str) -> Vec<u8> {
     let s = hex.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
     s.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             let hi = char::from(c[0]).to_digit(16).expect("fixture is valid hex");
             let lo = char::from(c[1]).to_digit(16).expect("fixture is valid hex");

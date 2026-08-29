@@ -400,11 +400,12 @@ impl Quote {
             return Err(ParseError::InvalidHex);
         }
         let mut bytes = Vec::with_capacity(s.len() / 2);
-        for chunk in s.as_bytes().chunks_exact(2) {
-            let (hi, lo) = match chunk {
-                [h, l] => (*h, *l),
-                _ => return Err(ParseError::InvalidHex),
-            };
+        // `as_chunks` rather than `chunks_exact` (clippy 1.98's `chunks_exact_to_as_chunks`): the
+        // even-length check above guarantees the ignored remainder is always empty either way —
+        // but the array pattern is irrefutable, where the slice match needed a defensive arm for a
+        // length that cannot occur.
+        for chunk in s.as_bytes().as_chunks::<2>().0 {
+            let [hi, lo] = *chunk;
             let hi = char::from(hi).to_digit(16).ok_or(ParseError::InvalidHex)?;
             let lo = char::from(lo).to_digit(16).ok_or(ParseError::InvalidHex)?;
             let byte = u8::try_from((hi << 4) | lo).map_err(|_| ParseError::InvalidHex)?;

@@ -37,7 +37,9 @@ const LICENSED_IMAGE: &str =
 fn quote_bytes() -> Vec<u8> {
     let s = QUOTE_HEX.trim();
     s.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             let hi = char::from(c[0]).to_digit(16).expect("hex");
             let lo = char::from(c[1]).to_digit(16).expect("hex");

@@ -55,7 +55,21 @@ use core::fmt;
 /// a string is — only that it is safe to interpolate.
 ///
 /// The only constructor is [`Cid::parse`]; the inner field is private so that no caller — however
-/// indirect — can build a [`ComposeUri::Ipfs`] holding an unvalidated string.
+/// indirect — can build a [`ComposeUri::Ipfs`] holding an unvalidated string. As with
+/// [`ComposeUrl`], nothing stops a *future* `From<String>`, `FromStr`, or derived `Deserialize`
+/// impl from reopening that bypass by a different door, so the example below is kept as a compiled
+/// regression guard rather than only a prose claim.
+///
+/// # Examples
+///
+/// The private field means a raw tuple literal cannot be built even from within this crate's own
+/// dependents:
+///
+/// ```compile_fail
+/// use verity_verifier::compose::ComposeUri;
+///
+/// let bad = ComposeUri::Ipfs("../../../etc/passwd".to_owned());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Cid(String);
 

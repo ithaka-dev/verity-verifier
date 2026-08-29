@@ -37,7 +37,9 @@ const MIN_PARSEABLE: usize = 4940;
 fn valid_bytes() -> Vec<u8> {
     let s = VALID.trim();
     s.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             let hi = char::from(c[0]).to_digit(16).unwrap();
             let lo = char::from(c[1]).to_digit(16).unwrap();
